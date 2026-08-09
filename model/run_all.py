@@ -80,10 +80,29 @@ def run_step1_preprocess_unlabeled_data():
     ])
 
 @timed_step
+def run_step1b_preprocess_val_data():
+    """Val 원본 오디오를 최소 길이 보장(패딩만, 자르지 않음)으로 전처리합니다.
+
+    [신설 2026-08-09] 전에는 val 단계가 없어서 train_mark5.py 가 dataset_labeled.csv 를
+    파일명 해시로 10% 갈라 val 로 썼고, 수집 단계에서 세션 단위로 갈라 둔 split 이 무시됐다.
+    """
+    return run_subprocess([
+        sys.executable, os.path.join(pre_dir, "fix_audio_length.py"),
+        "--input_dir", os.path.join(project_root, "data_source_val"),
+        "--output_dir", os.path.join(project_root, "data_val")
+    ])
+
+@timed_step
 def run_step2_generate_dataset_index():
     """학습에 사용할 Labeled/Unlabeled 데이터셋 인덱스 CSV 파일을 생성합니다."""
     return run_subprocess([sys.executable, os.path.join(pre_dir, "generate_dataset_index_mark5.py"),
                            "--mode", "train", "--mark_version", mark_version])
+
+@timed_step
+def run_step2b_generate_val_index():
+    """검증에 사용할 Val 데이터셋 인덱스 CSV 파일을 생성합니다. [신설 2026-08-09]"""
+    return run_subprocess([sys.executable, os.path.join(pre_dir, "generate_dataset_index_mark5.py"),
+                           "--mode", "val", "--mark_version", mark_version])
 
 @timed_step
 def run_step3_student_model_train():
@@ -128,7 +147,9 @@ if __name__ == "__main__":
     steps = [
         run_step0_preprocess_labeled_data,
         run_step1_preprocess_unlabeled_data,
+        run_step1b_preprocess_val_data,      # [신설 2026-08-09] data_source_val -> data_val
         run_step2_generate_dataset_index,
+        run_step2b_generate_val_index,       # [신설 2026-08-09] dataset_val.csv
         run_step3_student_model_train,
         run_step_4_preprocess_test_data,
         run_step_5_generate_test_index,

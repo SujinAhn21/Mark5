@@ -33,7 +33,12 @@ if SHARED_DIR not in sys.path:
 from checkpoint_utils import apply_config_metadata, load_checkpoint, resolve_state_dict, save_checkpoint
 
 
-def _resolve_csv_path(filename):
+def _resolve_csv_path(filename, required=True):
+    """CSV 를 찾아 경로를 돌려준다.
+
+    [변경 2026-08-09] required=False 를 추가했다. dataset_val.csv 는 있으면 쓰고 없으면
+    옛 방식으로 폴백해야 해서, 없을 때 예외 대신 None 이 필요하다.
+    """
     candidates = [
         os.path.join(PROJECT_ROOT, filename),
         os.path.join(BASE_DIR, filename),
@@ -42,6 +47,8 @@ def _resolve_csv_path(filename):
     for path in candidates:
         if os.path.exists(path):
             return path
+    if not required:
+        return None
     raise FileNotFoundError(f"[ERROR] CSV 파일을 찾을 수 없습니다: {candidates}")
 
 
@@ -214,6 +221,13 @@ class DistillationLoss(nn.Module):
 
 
 def _stable_file_split(path, val_ratio=0.1):
+    """[폴백 전용 / 2026-08-09] dataset_val.csv 가 없을 때만 쓰는 옛 방식.
+
+    파일명 해시로 10% 를 val 로 뗀다. 재현은 되지만 **수집 단계에서 세션 단위로 갈라 둔
+    split 을 무시한다** — 같은 세션(같은 녹음 시간대)의 클립이 train 과 val 에 함께 들어가
+    val 성능이 낙관 편향된다. mark4.x 는 data/{split} 폴더로 나뉘어 있어 이 문제가 없었고,
+    mark5 도 2026-08-09 부터 data_source_val -> data_val -> dataset_val.csv 를 쓴다.
+    """
     key = os.path.basename(path).encode("utf-8")
     digest = hashlib.md5(key).hexdigest()
     bucket = int(digest[:8], 16) / 0xFFFFFFFF
@@ -232,15 +246,36 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
     labeled_dataset = SemiSupervisedDataset(labeled_files, parser, config, is_labeled=True)
     unlabeled_dataset = SemiSupervisedDataset(unlabeled_files, parser, config, is_labeled=False)
 
-    train_samples = []
-    val_samples = []
-    for sample in labeled_dataset.samples:
-        _, label, metadata = sample
-        split_name = _stable_file_split(metadata["path"], val_ratio=0.1)
-        if split_name == "val":
-            val_samples.append(sample)
-        else:
-            train_samples.append(sample)
+    # [변경 2026-08-09] val 을 dataset_val.csv 에서 읽는다.
+    # 수집 단계(mark5_slicer.py)에서 SINS·CHiME 은 세션 단위로, AI Hub 는 클립 단위로
+    # train/val/test 를 갈라 두었다. 그런데 이 함수가 dataset_labeled.csv 를 파일명 해시로
+    # 10% 떼어 val 을 만들고 있어서 그 분리가 통째로 무시되고 있었다(같은 세션 클립이
+    # train 과 val 에 섞임 -> val 성능이 낙관 편향). dataset_val.csv 가 있으면 그것을 쓰고,
+    # 없을 때만 옛 해시 분할로 폴백하되 눈에 띄게 경고한다.
+    val_csv = _resolve_csv_path("dataset_val.csv", required=False)
+    if val_csv and os.path.exists(val_csv):
+        val_files = list(csv.DictReader(open(val_csv, newline="", encoding="utf-8")))
+        val_dataset_src = SemiSupervisedDataset(val_files, parser, config, is_labeled=True)
+        train_samples = list(labeled_dataset.samples)
+        val_samples = list(val_dataset_src.samples)
+        print(f"[INFO] val 을 dataset_val.csv 에서 읽었습니다 — "
+              f"train {len(train_samples)}개 / val {len(val_samples)}개 (폴더 기반 분리)")
+    else:
+        print("[WARN] " + "=" * 70)
+        print("[WARN] dataset_val.csv 가 없어 파일명 해시로 train 의 10% 를 val 로 뗍니다(옛 방식).")
+        print("[WARN] 이러면 수집 단계의 세션 단위 split 이 무시되어 val 성능이 낙관 편향됩니다.")
+        print("[WARN] preprocessing/fix_audio_length.py 로 data_source_val -> data_val 을 만들고")
+        print("[WARN] generate_dataset_index_mark5.py --mode val 을 먼저 돌리십시오.")
+        print("[WARN] " + "=" * 70)
+        train_samples = []
+        val_samples = []
+        for sample in labeled_dataset.samples:
+            _, label, metadata = sample
+            split_name = _stable_file_split(metadata["path"], val_ratio=0.1)
+            if split_name == "val":
+                val_samples.append(sample)
+            else:
+                train_samples.append(sample)
 
     train_dataset = SampleListDataset(train_samples)
     val_dataset = SampleListDataset(val_samples)

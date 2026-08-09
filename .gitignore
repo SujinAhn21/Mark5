@@ -1,38 +1,12 @@
-# === 제외 (커밋 안 함) ===
-
-# Python 캐시
-__pycache__/
-*.py[cod]
-*$py.class
-
-# 가상환경
-.venv/
-venv/
-env/
-
-# 에디터/IDE 로컬 설정
-.vscode/
-.idea/
-
-# OS 파일
-.DS_Store
-Thumbs.db
-
-# 오디오 원본/전처리 데이터 (용량 커서 제외)
+# [변경 2026-08-09] Mark4.x 와 같은 방침으로 통일 — 오디오 원본만 깃에서 빼고 나머지는 전부 커밋한다.
+# (2026-08-02 에 Mark4.1~4.8 여덟 저장소를 이 두 줄로 통일했고, Mark5 만 옛 상태로 남아 있었다.)
+# 원본 오디오는 구글 드라이브에 있고, plots·모델·인덱스·라벨·logFiles 는 전부 저장소에 올린다.
+data_source_labeled/
+data_source_unlabeled/
+data_source_val/
+data_source_test/
+data_labeled/
+data_unlabeled/
+data_val/
+data_test/
 *.wav
-*.mp3
-*.m4a
-*.flac
-
-# 생성되는 데이터 인덱스/중간 산출물
-dataset_*.csv
-*.pkl
-cache/
-
-# 실행 로그
-*.log
-logFiles/
-
-# === 포함 (교수님 확인용으로 일부러 올림) ===
-#   plots/        : 그래프·시각화 결과  -> ignore 안 함
-#   *.pth, *.pt   : 모델 가중치(teacher pool, student) -> ignore 안 함
