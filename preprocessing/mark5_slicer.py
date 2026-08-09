@@ -345,7 +345,7 @@ def build_queue(items, want):
     by_act = defaultdict(list)
     for r in items:
         by_act[r["activity"]].append(r)
-    queue, leftover = [], []
+    queue, leftover, rest_by_act = [], [], []
     for a in sorted(by_act):
         want_a = q.get(a, 0)
         by_sess = defaultdict(list)
@@ -357,7 +357,13 @@ def build_queue(items, want):
                 if by_sess[s] and len(picked) < want_a:
                     picked.append(by_sess[s].pop(0))
         queue.extend(picked)
-        leftover.extend(r for s in sorted(by_sess) for r in by_sess[s])
+        rest_by_act.append([r for s in sorted(by_sess) for r in by_sess[s]])
+    # [2026-08-09 수정] 예비 목록도 활동을 번갈아 꺼낸다. 전에는 활동 순서대로 이어붙여서
+    # pop(0) 이 사전순 첫 활동만 소진했다(take_aihub 에서 카테고리로 같은 문제를 고쳤던 것).
+    while any(rest_by_act):
+        for lst in rest_by_act:
+            if lst:
+                leftover.append(lst.pop(0))
     return queue, leftover
 
 
@@ -395,6 +401,29 @@ def out_dir(split, cls):
     return os.path.join(PROJECT_ROOT, SPLIT_DIRS[split], cls)
 
 
+# ── unlabeled 모드 ────────────────────────────────────────────────────────────
+# [신설 2026-08-09] mark5 는 반지도 구조다. 학습 루프가 배치를 둘로 갈라
+#     labeled   -> student 예측 vs 정답 라벨          -> hard loss
+#     unlabeled -> student 예측 vs 8개 teacher 판정   -> soft loss + feature KD
+# 로 쓰는데, **unlabeled 가 0개면 `if unlabeled_indices:` 블록이 한 번도 실행되지 않아
+# ensemble_teacher 가 아예 호출되지 않는다.** 즉 Dynamic Online Ensemble KD 가 통째로
+# 빠지고 순수 supervised 학습이 된다(2026-08-09 실측으로 확인).
+#
+# 그래서 labeled 와 별개로 unlabeled 를 수집한다. 핵심 규칙 세 가지:
+#   (1) **라벨을 붙이지 않는다.** 클래스 폴더 없이 평평하게 저장한다
+#       (data_source_unlabeled/unlabeled_NNNN.wav). teacher 가 판정할 재료이므로 정답이 없다.
+#   (2) **labeled train 과 같은 클래스 분배로 뽑는다.** 8개 teacher 가 각자 전문 영역의 재료를
+#       고르게 받아야 증류 신호가 한쪽으로 쏠리지 않는다. AI Hub 만 뽑으면 media_talking
+#       전문가가 놀고, SINS·CHiME 만 뽑으면 나머지 7명이 논다.
+#   (3) **val·test 에는 넣지 않는다.** 정답이 없어 채점에 쓸 수 없다. 그래서 labeled 의
+#       70:15:15(2000/430/430) 비율은 그대로 유지된다 — unlabeled 는 별개 축이다.
+UNLABELED_DIR = "data_source_unlabeled"
+
+
+def unlabeled_out_path(idx):
+    return os.path.join(PROJECT_ROOT, UNLABELED_DIR, f"unlabeled_{idx:04d}.wav")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--aihub_root", type=str,
@@ -414,6 +443,12 @@ def main():
     ap.add_argument("--others_house_ratio", type=float, default=0.5,
                     help="others 안에서 집 녹음(SINS+CHiME)이 차지할 비율(나머지는 AI Hub 15종). "
                          "높이면 채널 단서가 줄지만 others 의 AI Hub 다양성이 준다")
+    ap.add_argument("--mode", type=str, default="labeled", choices=["labeled", "unlabeled"],
+                    help="labeled: train/val/test 를 클래스 폴더에 수집(기본). "
+                         "unlabeled: 라벨 없이 data_source_unlabeled 에 평평하게 수집(증류용)")
+    ap.add_argument("--unlabeled_total", type=int, default=2000,
+                    help="--mode unlabeled 일 때 수집할 개수. 기본 2000 = labeled train 과 1:1. "
+                         "val·test 에는 넣지 않으므로 labeled 의 70:15:15 비율은 그대로 유지된다")
     ap.add_argument("--dry_run", action="store_true")
     ap.add_argument("--no_quality_check", action="store_true")
     ap.add_argument("--keep_dc", action="store_true",
@@ -549,6 +584,38 @@ def main():
             print(f"  - {cls} / {sp}: 필요 {want}, 있음 {have}")
         sys.exit(1)
 
+    if args.mode == "unlabeled":
+        un_q = split_quota(args.unlabeled_total, classes)
+        print(f"\n[계획/unlabeled] 총 {args.unlabeled_total}개 — 라벨 없이 "
+              f"{UNLABELED_DIR}/unlabeled_NNNN.wav 로 평평하게 저장")
+        print("  labeled train 과 같은 클래스 분배로 뽑되 라벨은 붙이지 않는다"
+              "(teacher 8명이 각자 전문 영역의 재료를 고르게 받도록).")
+        print("  SINS·CHiME 은 train split 에서만 꺼낸다 — val·test 세션에서 뽑으면 라벨이 없어도"
+              " 그 세션 소리가 학습에 들어가 누수가 된다.")
+        for cls in classes:
+            want = un_q[cls]
+            if cls == "media_talking":
+                a = want // 2
+                av_s = len(pool_sins.get(("train", "target"), []))
+                av_c = len(pool_chime.get(("train", "target"), []))
+                ok = "OK" if (av_s >= a and av_c >= want - a) else "부족"
+                print(f"   {cls:14s} {want:4d} = SINS {a}<={av_s} + CHiME {want-a}<={av_c}   {ok}")
+            elif cls == "others":
+                n_house = int(round(want * args.others_house_ratio))
+                a = n_house // 2
+                av_s = len(pool_sins.get(("train", "others"), []))
+                av_c = len(pool_chime.get(("train", "others"), []))
+                av_a = len(pool_aihub["others"])
+                ok = ("OK" if (av_s >= a and av_c >= n_house - a and av_a >= want - n_house)
+                      else "부족")
+                print(f"   {cls:14s} {want:4d} = SINS {a}<={av_s} + CHiME {n_house-a}<={av_c}"
+                      f" + AI Hub {want-n_house}<={av_a}   {ok}")
+            else:
+                av = len(pool_aihub[cls])
+                print(f"   {cls:14s} {want:4d} = AI Hub {want}<={av}   "
+                      f"{'OK' if av >= want else '부족'}")
+        print("  ⚠val·test 에는 넣지 않으므로 labeled 의 70:15:15(2000/430/430) 는 그대로 유지된다.")
+
     if args.dry_run:
         print("\n[DRY RUN] 추출은 하지 않고 종료합니다.")
         return
@@ -561,6 +628,7 @@ def main():
         prov["source"] = "fsd50k"
 
     new_rows, rejected, unfilled = [], [], []
+    unlabeled_counter = [0]     # unlabeled 파일 일련번호(리스트로 둬 중첩 함수에서 갱신)
     used_clip = set(used_src)          # mark5 안에서 한 원본 클립은 한 번만
     cat_used, act_used = defaultdict(int), defaultdict(int)
     t0 = time.time()
@@ -568,7 +636,38 @@ def main():
     done = 0
 
     def save(seg, cls, sp, idx, rec):
-        """3초 파형을 저장하고 provenance 행을 만든다."""
+        """3초 파형을 저장하고 provenance 행을 만든다.
+
+        [변경 2026-08-09] unlabeled 모드(sp == "unlabeled")에서는 클래스 폴더를 만들지 않고
+        평평하게 저장한다. 라벨이 없는 데이터라 클래스별로 나눌 근거가 없고, 학습 코드도
+        dataset_unlabeled.csv 를 path 한 열로만 읽는다(generate_train_index 의 unlabeled 분기).
+        어느 카테고리에서 뽑았는지는 provenance 의 aihub_category 에 남으므로 추적은 된다.
+        """
+        if sp == "unlabeled":
+            unlabeled_counter[0] += 1
+            path = unlabeled_out_path(unlabeled_counter[0])
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            name = os.path.basename(path)
+            sf.write(path, seg, TARGET_SR, subtype="FLOAT")
+            new_rows.append({
+                "local_filename": name,
+                "original_labels": rec["category"],
+                # target_class 는 '뽑아온 영역'을 기록해 둔다(라벨이 아니라 추적용).
+                # 학습에서는 dataset_unlabeled.csv 에 path 만 들어가므로 이 값이 쓰이지 않는다.
+                "target_class": f"unlabeled:{cls}", "assigned_split": "unlabeled",
+                "mark_version": MARK_VERSION,
+                "sha256": hashlib.sha256(open(path, "rb").read()).hexdigest(),
+                "size_bytes": os.path.getsize(path),
+                "download_date": date.today().isoformat(), "source_type": "original",
+                "removed_20260715": "active",
+                "source": rec["source"],
+                "aihub_src_file": rec["wav"],
+                "aihub_category": rec["category"],
+                "aihub_volume": rec["volume"],
+                "seg_start_sec": round(rec["start"], 3),
+                "seg_end_sec": round(rec["start"] + SEG_SEC, 3),
+            })
+            return
         d = out_dir(sp, cls)
         os.makedirs(d, exist_ok=True)
         name = f"{cls}_{sp}_{idx:03d}.wav"
@@ -591,7 +690,7 @@ def main():
             "seg_end_sec": round(rec["start"] + SEG_SEC, 3),
         })
 
-    def take_aihub(cls, sp, want, pool, idx0):
+    def take_aihub(cls, sp, want, pool, idx0, save_sp=None):
         """AI Hub 풀에서 want 개를 뽑아 저장한다. 카테고리 균등 배분 + 예비도 카테고리 라운드로빈.
 
         [2026-08-09 수정] 두 가지를 고쳤다.
@@ -643,7 +742,7 @@ def main():
             if bad is not None:
                 rejected.append((w, cat, bad))
                 continue
-            save(seg, cls, sp, idx,
+            save(seg, cls, save_sp or sp, idx,
                  {"category": cat, "wav": w, "volume": os.path.basename(d)[:2],
                   "start": start, "source": "aihub"})
             used_clip.add(w)
@@ -655,10 +754,11 @@ def main():
             unfilled.append((sp, cls, "aihub", want, made))
         return idx
 
-    def take_chime(cls, sp, role, want, idx0):
+    def take_chime(cls, sp, role, want, idx0, save_sp=None):
         """CHiME 풀에서 want 개를 뽑아 저장한다. 조합별 쿼터 + 세션 라운드로빈 + 창 3순위."""
         nonlocal done
-        items = pool_chime.get((sp, role), [])
+        # [2026-08-09 수정] take_sins 와 같은 이유로 이미 쓴 클립을 먼저 거른다.
+        items = [r for r in pool_chime.get((sp, role), []) if r["wav"] not in used_clip]
         queue, leftover = build_queue(items, want)
         idx, made = idx0, 0
         while made < want and (queue or leftover):
@@ -682,7 +782,7 @@ def main():
             if got is None:
                 continue
             start, seg = got
-            save(seg, cls, sp, idx,
+            save(seg, cls, save_sp or sp, idx,
                  {"category": rec["activity"], "wav": rec["wav"],
                   "volume": rec["sess"], "start": start, "source": "chime_home"})
             used_clip.add(rec["wav"])
@@ -694,10 +794,15 @@ def main():
             unfilled.append((sp, cls, "chime", want, made))
         return idx
 
-    def take_sins(cls, sp, role, want, idx0):
+    def take_sins(cls, sp, role, want, idx0, save_sp=None):
         """SINS 풀에서 want 개를 뽑아 저장한다. 활동별 쿼터 + 세션 라운드로빈 + 창 3순위 재시도."""
         nonlocal done
-        items = pool_sins.get((sp, role), [])
+        # [2026-08-09 수정] 이미 쓴 클립을 **쿼터 계산 전에** 거른다. take_aihub 와 같은 버그가
+        # 여기 남아 있었다 — queue 항목이 전부 used_clip 이면 통째로 skip 되고 예비 목록(활동
+        # 사전순으로 이어붙인 것)의 첫 활동만 채워진다. labeled 수집은 provenance 를 비우고
+        # 시작해 드러나지 않았고, unlabeled(labeled 2,860개 위에 얹음)에서 SINS others 55개가
+        # 전부 cooking 으로 쏠려 발견됐다.
+        items = [r for r in pool_sins.get((sp, role), []) if r["wav"] not in used_clip]
         d = os.path.join(sins_root, sp, role)
         queue, leftover = build_queue(items, want)
         idx, made = idx0, 0
@@ -722,7 +827,7 @@ def main():
             if got is None:
                 continue
             start, seg = got
-            save(seg, cls, sp, idx,
+            save(seg, cls, save_sp or sp, idx,
                  {"category": rec["activity"], "wav": rec["wav"],
                   "volume": f"DevNode{rec['node']}", "start": start, "source": "sins"})
             used_clip.add(rec["wav"])
@@ -734,23 +839,49 @@ def main():
             unfilled.append((sp, cls, "sins", want, made))
         return idx
 
-    for sp in ("val", "test", "train"):
-        print(f"\n##### {sp} #####", flush=True)
+    if args.mode == "unlabeled":
+        # labeled train 과 같은 클래스 분배로 뽑되 라벨은 붙이지 않는다.
+        # SINS·CHiME 은 **train split 에서만** 꺼낸다 — val·test 세션에서 뽑으면 라벨이 없어도
+        # 그 세션의 소리가 학습에 들어가 누수가 된다(연속 녹음이라 같은 상황을 담고 있음).
+        # AI Hub 는 세션 개념이 없고 클립 단위 중복 방지가 걸려 있어 그대로 쓴다.
+        un_q = split_quota(args.unlabeled_total, classes)
+        n_s = args.unlabeled_total // len(classes) // 2
+        print(f"\n##### unlabeled ({args.unlabeled_total}개) #####", flush=True)
         for cls in classes:
-            want = quota[sp][cls]
+            want = un_q[cls]
             if cls == "media_talking":
-                n_sins, n_chime = media_split[sp]
-                nxt = take_sins(cls, sp, "target", n_sins, 1)
-                take_chime(cls, sp, "target", n_chime, nxt)
+                a = want // 2
+                nxt = take_sins(cls, "train", "target", a, 1, save_sp="unlabeled")
+                take_chime(cls, "train", "target", want - a, nxt, save_sp="unlabeled")
             elif cls == "others":
-                n_sins, n_chime, n_aihub = others_split[sp]
-                nxt = take_sins(cls, sp, "others", n_sins, 1)
-                nxt = take_chime(cls, sp, "others", n_chime, nxt)
-                take_aihub(cls, sp, n_aihub, pool_aihub["others"], nxt)
+                n_house = int(round(want * args.others_house_ratio))
+                a = n_house // 2
+                nxt = take_sins(cls, "train", "others", a, 1, save_sp="unlabeled")
+                nxt = take_chime(cls, "train", "others", n_house - a, nxt, save_sp="unlabeled")
+                take_aihub(cls, "train", want - n_house, pool_aihub["others"], nxt,
+                           save_sp="unlabeled")
             else:
-                take_aihub(cls, sp, want, pool_aihub[cls], 1)
-            print(f"  {cls:14s} {want:3d}개  (누적 {done}/{todo}, "
+                take_aihub(cls, "train", want, pool_aihub[cls], 1, save_sp="unlabeled")
+            print(f"  {cls:14s} {want:3d}개  (누적 {done}/{args.unlabeled_total}, "
                   f"{(time.time()-t0)/60:.1f}분)", flush=True)
+    else:
+        for sp in ("val", "test", "train"):
+            print(f"\n##### {sp} #####", flush=True)
+            for cls in classes:
+                want = quota[sp][cls]
+                if cls == "media_talking":
+                    n_sins, n_chime = media_split[sp]
+                    nxt = take_sins(cls, sp, "target", n_sins, 1)
+                    take_chime(cls, sp, "target", n_chime, nxt)
+                elif cls == "others":
+                    n_sins, n_chime, n_aihub = others_split[sp]
+                    nxt = take_sins(cls, sp, "others", n_sins, 1)
+                    nxt = take_chime(cls, sp, "others", n_chime, nxt)
+                    take_aihub(cls, sp, n_aihub, pool_aihub["others"], nxt)
+                else:
+                    take_aihub(cls, sp, want, pool_aihub[cls], 1)
+                print(f"  {cls:14s} {want:3d}개  (누적 {done}/{todo}, "
+                      f"{(time.time()-t0)/60:.1f}분)", flush=True)
 
     if new_rows:
         merged = pd.concat([prov, pd.DataFrame(new_rows)], ignore_index=True)

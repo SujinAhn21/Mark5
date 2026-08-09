@@ -241,7 +241,24 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
     parser = AudioParser(config, segment_mode=True)
 
     labeled_files = list(csv.DictReader(open(_resolve_csv_path("dataset_labeled.csv"), newline="", encoding="utf-8")))
-    unlabeled_files = list(csv.DictReader(open(_resolve_csv_path("dataset_unlabeled.csv"), newline="", encoding="utf-8")))
+
+    # [변경 2026-08-09] dataset_unlabeled.csv 가 없어도 터지지 않게 하되, **크게 경고한다.**
+    # 이 파일이 없으면 unlabeled 샘플이 0개가 되고, 아래 학습 루프의
+    #     if unlabeled_indices:  ...  ensemble_teacher(...)
+    # 블록이 한 번도 실행되지 않는다. 즉 **8개 teacher 가 한 번도 불리지 않고 soft loss·feature KD 가
+    # 전혀 없는 순수 supervised 학습**이 된다. mark5 의 핵심(Dynamic Online Ensemble KD)이
+    # 통째로 빠지므로 조용히 넘어가면 안 된다.
+    unlabeled_csv = _resolve_csv_path("dataset_unlabeled.csv", required=False)
+    unlabeled_files = (list(csv.DictReader(open(unlabeled_csv, newline="", encoding="utf-8")))
+                       if unlabeled_csv else [])
+    if not unlabeled_files:
+        print("[WARN] " + "=" * 74)
+        print("[WARN] unlabeled 데이터가 0개입니다 — 지식 증류가 작동하지 않습니다.")
+        print("[WARN]   · 8개 teacher(ensemble_teacher)가 한 번도 호출되지 않습니다.")
+        print("[WARN]   · soft loss / feature KD 가 전부 0 이고 hard loss 만 남습니다.")
+        print("[WARN]   · 결과적으로 순수 supervised 학습이 됩니다(mark5 의 novelty 상실).")
+        print("[WARN] data_source_unlabeled 를 채우고 run_all.py 의 unlabeled 단계를 돌리십시오.")
+        print("[WARN] " + "=" * 74)
 
     labeled_dataset = SemiSupervisedDataset(labeled_files, parser, config, is_labeled=True)
     unlabeled_dataset = SemiSupervisedDataset(unlabeled_files, parser, config, is_labeled=False)

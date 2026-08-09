@@ -58,7 +58,8 @@ PROJECT_ROOT = os.path.abspath(os.path.join(BASE_DIR, ".."))
 
 # 폴더명 -> provenance 의 assigned_split 값(mark5 는 폴더명이 다르다)
 DIR2SPLIT = {"data_source_labeled": "train", "data_source_val": "val",
-             "data_source_test": "test", "train": "train", "val": "val", "test": "test"}
+             "data_source_test": "test", "data_source_unlabeled": "unlabeled",
+             "train": "train", "val": "val", "test": "test"}
 
 # 임계값 — 넘으면 WARN, 크게 넘으면 FAIL
 TH = {
@@ -106,11 +107,23 @@ def main():
     if m.empty:
         print(f"[ERROR] provenance 에 {args.mark_version} active 행이 없습니다.")
         sys.exit(1)
+    # [추가 2026-08-09] unlabeled 는 라벨이 없어 ①③④⑤ 검사 대상이 아니다.
+    # (target_class 에 'unlabeled:xxx' 로 뽑아온 영역만 추적용으로 기록돼 있다)
+    # 그대로 두면 같은 세션에 여러 '클래스'가 있는 것처럼 보여 SINS 가 mixable 로 오판되고,
+    # ③ 에서 세션마다 FAIL 이 쏟아진다. 그래서 labeled(train/val/test)만 떼어 검사한다.
+    un = m[m["assigned_split"] == "unlabeled"]
+    m = m[m["assigned_split"] != "unlabeled"]
     orig = m[m["source_type"] == "original"] if "source_type" in m.columns else m
     aug = m[m["source_type"] != "original"] if "source_type" in m.columns else m.iloc[0:0]
     classes = sorted(m["target_class"].dropna().unique())
-    print(f"\n{'='*78}\n[감사] {args.mark_version} — active {len(m)}행 "
-          f"(원본 {len(orig)} / 증강 {len(aug)}), 클래스 {len(classes)}개\n{'='*78}\n")
+    print(f"\n{'='*78}\n[감사] {args.mark_version} — labeled active {len(m)}행 "
+          f"(원본 {len(orig)} / 증강 {len(aug)}), 클래스 {len(classes)}개"
+          + (f" | unlabeled {len(un)}행" if len(un) else "")
+          + f"\n{'='*78}\n")
+    if len(un):
+        src = dict(un["source"].value_counts()) if "source" in un.columns else {}
+        report("OK", "⓪unlabeled",
+               f"{len(un)}개 (라벨 없음 — ①③④⑤ 검사 제외). 출처 {src}")
 
     # ---------- ① 출처 × 클래스 ----------
     print("① 출처가 클래스를 알려주는가")
@@ -265,10 +278,10 @@ def main():
             n = sum(1 for f in fns if f.lower().endswith(".wav"))
             disk += n
             per_split[DIR2SPLIT.get(sp.strip(), sp.strip())] += n
-    prov_per = Counter(m["assigned_split"])
-    ok = disk == len(m) and all(per_split[k] == prov_per.get(k, 0) for k in per_split)
+    prov_per = Counter(list(m["assigned_split"]) + list(un["assigned_split"]))
+    ok = disk == len(m) + len(un) and all(per_split[k] == prov_per.get(k, 0) for k in per_split)
     report("OK" if ok else "FAIL", "⑦",
-           f"디스크 {disk} / provenance active {len(m)}  "
+           f"디스크 {disk} / provenance active {len(m) + len(un)}  "
            + ", ".join(f"{k} {per_split[k]}vs{prov_per.get(k,0)}" for k in sorted(per_split)))
 
     # ---------- 총평 ----------
