@@ -85,6 +85,28 @@ class AudioViLDConfig:
         self.use_feature_kd = True
         self.feature_kd_weight = 0.3
         self.feature_kd_loss_type = "cosine_l1"
+
+        # === DKD (Decoupled Knowledge Distillation, Zhao et al. 2022) ===
+        # [신설 2026-08-09] soft loss 계산 방식을 vanilla KD <-> DKD 로 갈아끼우는 스위치.
+        # False 면 기존 경로(단일 KL divergence)를 그대로 타므로 지금까지의 학습과 동일하다.
+        #
+        # 왜 mark5 에서야 넣는가: DKD 는 KD 손실을 TCKD(타겟 vs 비타겟 이진 분포)와
+        # NCKD(비타겟 클래스들끼리의 분포)로 분해한다. mark4.x 는 2-class 라 비타겟이 1개뿐이라
+        # NCKD 가 항상 0 이고 DKD 가 vanilla 의 상수배(no-op)였다(2026-07-15 확인). 9-class 인
+        # mark5 에서 처음으로 의미를 갖는다.
+        #
+        # ⚠타겟 클래스는 **teacher 앙상블의 argmax** 를 쓴다. 원논문은 supervised 세팅이라
+        # ground-truth 라벨로 타겟을 정하는데, mark5 의 KD 는 unlabeled 에 걸리므로 정답이 없다.
+        # 이미 teacher 의 판정을 믿고 배우는 구조라 신뢰 구조가 새로 나빠지지는 않지만,
+        # **원논문 그대로가 아닌 변형**이므로 논문에 밝혀야 한다.
+        #
+        # beta=1.0 인 이유: vanilla KD 를 분해하면 KD = TCKD + (1 - p_t)·NCKD 라서 teacher 가
+        # 확신할수록(p_t -> 1) NCKD 가 눌린다. beta=1.0 은 "그 눌림만 푼다"는 뜻이고 그 이상
+        # 증폭하지 않는다. 원논문 권장값(CIFAR-100 beta=8, ImageNet beta=2)은 클래스가 100~1000개
+        # 일 때의 값이라, 9-class 인 여기서는 정보가 아니라 노이즈를 키울 위험이 크다.
+        self.use_dkd = False
+        self.dkd_alpha = 1.0
+        self.dkd_beta = 1.0
         self.visual_view_type = "mel_delta"
         self.segment_selection_mode = "salient_topk"
         self.max_visual_segments = self.max_segments

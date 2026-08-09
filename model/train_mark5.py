@@ -180,12 +180,63 @@ def custom_collate(batch):
     return torch.stack(mels, dim=0), list(labels), list(metadata)
 
 
+def dkd_loss(student_logits, teacher_logits, target_idx, T, dkd_alpha, dkd_beta):
+    """DKD(Decoupled Knowledge Distillation, Zhao et al. 2022) — KD 를 TCKD + NCKD 로 분해.
+
+        TCKD  타겟 클래스 vs 나머지 전체 의 **이진** 분포에 대한 KL
+        NCKD  타겟을 뺀 나머지 클래스들끼리 재정규화한 분포에 대한 KL
+        DKD   = dkd_alpha · TCKD + dkd_beta · NCKD
+
+    vanilla KD 를 분해하면 KD = TCKD + (1 - p_t)·NCKD 가 되어, teacher 가 확신할수록
+    NCKD(= dark knowledge 의 본체)가 눌린다. DKD 는 그 계수를 떼어내 독립적인 beta 로 세운다.
+
+    target_idx 는 호출부에서 **teacher 앙상블의 argmax** 로 넘긴다(unlabeled 라 정답이 없음).
+    """
+    n_cls = student_logits.size(1)
+    mask = F.one_hot(target_idx, num_classes=n_cls).bool()
+
+    ps = F.softmax(student_logits / T, dim=1)
+    pt = F.softmax(teacher_logits / T, dim=1)
+
+    # --- TCKD: [타겟, 비타겟합] 2차원 분포 ---
+    ps_t = ps[mask].unsqueeze(1)
+    pt_t = pt[mask].unsqueeze(1)
+    bs = torch.cat([ps_t, 1.0 - ps_t], dim=1).clamp_min(1e-8)
+    bt = torch.cat([pt_t, 1.0 - pt_t], dim=1).clamp_min(1e-8)
+    tckd = (bt * (bt.log() - bs.log())).sum(1).mean() * (T ** 2)
+
+    # --- NCKD: 타겟을 제외하고 재정규화한 분포 ---
+    # 타겟 위치를 -inf 로 눌러 softmax 에서 빠지게 한다. 그 자리는 log 가 -inf 가 되므로
+    # 합산 전에 0 으로 덮어 nan(0 * -inf)을 막는다.
+    s_nt = student_logits.masked_fill(mask, float("-inf"))
+    t_nt = teacher_logits.masked_fill(mask, float("-inf"))
+    log_ps_nt = F.log_softmax(s_nt / T, dim=1)
+    log_pt_nt = F.log_softmax(t_nt / T, dim=1)
+    pt_nt = log_pt_nt.exp()
+    kl = (pt_nt * (log_pt_nt - log_ps_nt)).masked_fill(mask, 0.0)
+    nckd = kl.sum(1).mean() * (T ** 2)
+
+    return dkd_alpha * tckd + dkd_beta * nckd, tckd, nckd
+
+
 class DistillationLoss(nn.Module):
-    def __init__(self, temperature, alpha, feature_kd_weight=0.0):
+    """[변경 2026-08-09] use_dkd 스위치 추가.
+
+    False 면 기존 경로(단일 KL divergence)를 그대로 타므로 이전 학습과 동일하게 동작한다.
+    True 면 soft 항만 DKD 로 바뀌고, hard/feature KD 와 alpha(hard vs soft 균형)는 건드리지 않는다.
+    alpha 와 dkd_alpha/dkd_beta 는 **층이 다르다** — alpha 는 hard vs KD 의 균형이고
+    dkd_alpha/beta 는 KD 내부에서 TCKD vs NCKD 의 균형이다.
+    """
+
+    def __init__(self, temperature, alpha, feature_kd_weight=0.0,
+                 use_dkd=False, dkd_alpha=1.0, dkd_beta=1.0):
         super().__init__()
         self.temperature = temperature
         self.alpha = alpha
         self.feature_kd_weight = feature_kd_weight
+        self.use_dkd = use_dkd
+        self.dkd_alpha = dkd_alpha
+        self.dkd_beta = dkd_beta
         self.hard = nn.CrossEntropyLoss()
         self.soft = nn.KLDivLoss(reduction="batchmean")
 
@@ -200,10 +251,17 @@ class DistillationLoss(nn.Module):
             total = total + (1 - self.alpha) * hard_loss
 
         if teacher_logits is not None and len(teacher_logits) > 0:
-            soft_loss = self.soft(
-                F.log_softmax(student_logits / self.temperature, dim=1),
-                F.softmax(teacher_logits / self.temperature, dim=1),
-            ) * (self.temperature ** 2)
+            if self.use_dkd:
+                # 타겟 축은 teacher 앙상블의 argmax. unlabeled 라 정답 라벨이 없다.
+                target_idx = teacher_logits.argmax(dim=1)
+                soft_loss, _, _ = dkd_loss(
+                    student_logits, teacher_logits, target_idx,
+                    self.temperature, self.dkd_alpha, self.dkd_beta)
+            else:
+                soft_loss = self.soft(
+                    F.log_softmax(student_logits / self.temperature, dim=1),
+                    F.softmax(teacher_logits / self.temperature, dim=1),
+                ) * (self.temperature ** 2)
             total = total + self.alpha * soft_loss
 
         if (
@@ -335,7 +393,17 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
     teacher_feature_cache = []
     unlabeled_metadata_cache = []
 
-    criterion = DistillationLoss(temperature=4.0, alpha=0.7, feature_kd_weight=config.feature_kd_weight if config.use_feature_kd else 0.0)
+    # [변경 2026-08-09] DKD 설정을 config 에서 읽는다. getattr 로 받아 옛 config 와도 호환.
+    _use_dkd = getattr(config, "use_dkd", False)
+    _dkd_a = getattr(config, "dkd_alpha", 1.0)
+    _dkd_b = getattr(config, "dkd_beta", 1.0)
+    criterion = DistillationLoss(
+        temperature=4.0, alpha=0.7,
+        feature_kd_weight=config.feature_kd_weight if config.use_feature_kd else 0.0,
+        use_dkd=_use_dkd, dkd_alpha=_dkd_a, dkd_beta=_dkd_b)
+    print(f"[INFO] KD 모드: {'DKD' if _use_dkd else 'vanilla KD'}"
+          + (f" (dkd_alpha={_dkd_a}, dkd_beta={_dkd_b}, 타겟축=teacher argmax)" if _use_dkd else "")
+          + f" | alpha=0.7, T=4.0, feature_kd={config.feature_kd_weight if config.use_feature_kd else 0.0}")
     optimizer_params = list(student_encoder.parameters()) + list(student_branch.parameters())
     if background_embedding is not None:
         optimizer_params += list(background_embedding.parameters())
