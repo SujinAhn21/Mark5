@@ -44,10 +44,28 @@ def extract_config_metadata(config) -> dict:
 
 
 def apply_config_metadata(config, ckpt: dict):
+    """체크포인트에 저장된 config 값을 config 객체에 되돌려 적용한다.
+
+    [수정 2026-08-17] setter 가 없는 @property 는 건너뛴다.
+    num_input_channels 는 AudioViLDConfig 에서 visual_view_type 으로부터 계산되는
+    읽기 전용 property 인데, extract_config_metadata 가 _CONFIG_KEYS 에 그것을 포함해
+    저장해 두기 때문에 setattr 에서 AttributeError 로 죽었다
+    ("property 'num_input_channels' ... has no setter").
+    이 함수는 mark5 의 EnsembleTeacher 에서만 호출되므로 mark4.x 에서는 드러나지 않았고,
+    mark5.0 학습을 처음 돌린 2026-08-17 에 teacher 8개를 로드하는 첫 줄에서 터졌다.
+
+    파생값을 건너뛰어도 잃는 정보는 없다. 계산의 근거인 visual_view_type 이 같은
+    metadata 에 들어 있어 함께 적용되고, 그러면 property 가 같은 값을 다시 계산한다
+    (teacher 8개 전부 visual_view_type='mel_delta' / num_input_channels=3 으로 확인).
+    """
     meta = ckpt.get("config_metadata", {})
     for key, val in meta.items():
-        if hasattr(config, key):
-            setattr(config, key, val)
+        if not hasattr(config, key):
+            continue
+        class_attr = getattr(type(config), key, None)
+        if isinstance(class_attr, property) and class_attr.fset is None:
+            continue
+        setattr(config, key, val)
 
 
 def save_checkpoint(

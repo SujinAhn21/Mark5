@@ -137,11 +137,31 @@ class AudioViLDConfig:
         self.explain_topk_segments = 3
         self.save_visual_explanations = True
         self.encoder_type = "cnn"
+        # [추가 2026-08-17] mark4.x teacher 8개는 2026-07-13 teacher 강화 이후 4블록
+        # TeacherAudioEncoder(약 49만 파라미터)로 학습돼 있다. mark5 의 EnsembleTeacher 가
+        # 그 .pth 를 읽을 때 같은 구조로 만들어야 하므로 True 로 둔다.
+        # False 로 두면 student 용 SimpleAudioEncoder(3블록)를 만들어 state_dict 가 안 맞는다.
+        # (student 자신의 인코더는 encoder_type 이 정하고 이 값의 영향을 받지 않는다.)
+        self.use_large_teacher_encoder = True
 
         # === 학습 파라미터 ===
         self.batch_size = 16
         self.num_epochs = 80
         self.learning_rate = 1e-4
+        # [추가 2026-08-17] mark4.x 와 학습 절차를 같게 맞추기 위한 값들.
+        # mark4.x 는 weight_decay 가 없어 val best 를 이른 에폭에 찍고 곧장 과적합하던 것을
+        # 실측하고 1e-4 를 넣었다. early stopping patience 10 도 mark4.x 와 같은 값이다.
+        self.weight_decay = 1e-4
+        self.early_stopping_patience = 10
+        # [추가 2026-08-17] KD 하이퍼파라미터. 값은 컨퍼런스 코드(mark3.2)에서 검증한 0.7 / 4.0 그대로이고,
+        # train_mark5.py 에 하드코딩돼 있던 것을 config 로 뺀 것뿐이다.
+        # mark4.x 의 0.3 / 2.0 은 같은 샘플에 hard·soft 를 함께 거는 구조에서 나온 값이라 옮겨오지 않는다.
+        self.distill_alpha = 0.7
+        self.distill_temperature = 4.0
+        # [추가 2026-08-18] teacher fusion 의 others 칸 조립 규칙: "min" | "mean" | "max".
+        # 기본 min. 옛 동작(다수결 편향이 있는 평균)으로 되돌리려면 "mean" 으로 두면 된다.
+        # 실측 근거는 vild/teacher_fusion.py 의 WeightedTeacherFusion docstring 참조.
+        self.fusion_others_rule = "min"
         self.text_loss_weight = 1.0
         self.image_loss_weight = 1.0
         self.device = "cuda" if torch.cuda.is_available() else "cpu"

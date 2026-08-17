@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -22,7 +23,12 @@ for p in (PROJECT_ROOT, UTILS_DIR, VILD_DIR):
 
 from feature_cache import get_feature_cache_path, get_metadata_cache_path
 from vild_config import AudioViLDConfig
-from vild_model import LearnableBackgroundEmbedding, ViLDTextHead, build_audio_encoder
+from vild_model import (
+    LearnableBackgroundEmbedding,
+    ViLDTextHead,
+    build_audio_encoder,
+    build_teacher_encoder,
+)
 from vild_head import DualBranchStudentHead
 from vild_parser_teacher import AudioParser
 from teacher_fusion import WeightedTeacherFusion
@@ -64,18 +70,61 @@ def _resolve_resource_path(filename):
     raise FileNotFoundError(f"[ERROR] 리소스 파일을 찾을 수 없습니다: {candidates}")
 
 
+def _align_teacher_arch(config, state_dict, class_name, ckpt_name):
+    """[추가 2026-08-17] teacher .pth 안의 키 이름을 보고 어느 인코더 구조인지 판정해
+    config.use_large_teacher_encoder 를 그것에 맞춘다.
+
+    이렇게 하는 이유: 구조가 안 맞으면 load_state_dict 가 Missing/Unexpected 키 수십 줄만
+    토하고 죽어서, 무엇이 문제인지 알아내는 데 시간이 걸린다(2026-08-17 실제로 그랬다).
+    설정 플래그보다 파일에 든 실물이 사실이므로 파일 기준으로 맞춘다.
+
+      conv_block1.*      -> SimpleAudioEncoder (student 인코더, 3블록·약 14.3만 파라미터.
+                            2026-08-17 이전에는 2블록 4.5만이었다)
+      model.3.0.weight   -> TeacherAudioEncoder (4블록, 약 49만 파라미터)
+    """
+    keys = set(state_dict.keys())
+    if any(k.startswith("conv_block1.") for k in keys):
+        detected_large = False
+    elif "model.3.0.weight" in keys:
+        detected_large = True
+    else:
+        raise RuntimeError(
+            f"[ERROR] teacher 체크포인트의 인코더 구조를 판정할 수 없습니다: {ckpt_name} "
+            f"(class={class_name}). 아는 구조는 SimpleAudioEncoder(conv_block1.*)와 "
+            f"TeacherAudioEncoder(model.3.0.weight) 두 가지입니다. "
+            f"실제 키 예시: {sorted(keys)[:5]}"
+        )
+
+    if getattr(config, "use_large_teacher_encoder", False) != detected_large:
+        arch = "TeacherAudioEncoder(4블록)" if detected_large else "SimpleAudioEncoder(student 인코더)"
+        print(
+            f"[INFO] teacher 인코더 구조를 체크포인트에 맞춰 조정합니다 — "
+            f"{class_name}: {arch} ({ckpt_name})"
+        )
+        config.use_large_teacher_encoder = detected_large
+    return detected_large
+
+
 class EnsembleTeacher:
-    def __init__(self, specialist_config, device):
+    def __init__(self, specialist_config, device, others_rule="min"):
         self.device = device
         self.specialists = {}
         self.embedding_dim = None
         self.fusion = None  # WeightedTeacherFusion은 배치마다 재생성하지 않고 1회 생성 후 재사용
+        self.others_rule = others_rule  # [추가 2026-08-18] fusion 의 others 칸 조립 규칙
         for class_name, paths in specialist_config.items():
             encoder_ckpt = load_checkpoint(_resolve_resource_path(paths["encoder_path"]), map_location=device)
             config = AudioViLDConfig(mark_version=paths["mark_version"])
             apply_config_metadata(config, encoder_ckpt)
-            encoder = build_audio_encoder(config).to(self.device)
-            encoder.load_state_dict(resolve_state_dict(encoder_ckpt, "model_state_dict", "encoder_state_dict", "model"))
+            # [수정 2026-08-17] student 용 build_audio_encoder 가 아니라 teacher 용
+            # build_teacher_encoder 를 쓴다. mark4.x teacher 8개는 2026-07-13 teacher 강화 이후
+            # 4블록 TeacherAudioEncoder 로 학습됐는데, 여기서 student 용 SimpleAudioEncoder 를 만들어
+            # 넣으려다 state_dict 가 안 맞아 죽었다. 작년 11월 더미 teacher(186KB)가 2블록이었기
+            # 때문에 이 코드가 그때 기준으로 남아 있었던 것이다.
+            encoder_state = resolve_state_dict(encoder_ckpt, "model_state_dict", "encoder_state_dict", "model")
+            _align_teacher_arch(config, encoder_state, class_name, paths["encoder_path"])
+            encoder = build_teacher_encoder(config).to(self.device)
+            encoder.load_state_dict(encoder_state)
             encoder.eval()
 
             classifier_ckpt = load_checkpoint(_resolve_resource_path(paths["classifier_path"]), map_location=device)
@@ -106,7 +155,13 @@ class EnsembleTeacher:
                 "features": region_emb,
             }
         if self.fusion is None:
-            self.fusion = WeightedTeacherFusion(student_class_map, self.embedding_dim, self.device)
+            # [변경 2026-08-18] others 조립 규칙을 config 에서 받는다. 기본은 min
+            # (평균은 무관한 전문가 7명의 "내 거 아님" 표까지 섞여 others 가 유리해진다.
+            #  근거 실측은 vild/teacher_fusion.py 의 docstring 참조).
+            self.fusion = WeightedTeacherFusion(
+                student_class_map, self.embedding_dim, self.device,
+                others_rule=self.others_rule,
+            )
         return self.fusion.fuse(fusion_inputs)
 
 
@@ -389,7 +444,9 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
         "water_shower": {"mark_version": "mark4.7", "encoder_path": "best_teacher_encoder_mark4.7.pth", "classifier_path": "best_teacher_classifier_mark4.7.pth"},
         "dog_bark": {"mark_version": "mark4.8", "encoder_path": "best_teacher_encoder_mark4.8.pth", "classifier_path": "best_teacher_classifier_mark4.8.pth"},
     }
-    ensemble_teacher = EnsembleTeacher(specialist_config, device)
+    _others_rule = getattr(config, "fusion_others_rule", "min")
+    ensemble_teacher = EnsembleTeacher(specialist_config, device, others_rule=_others_rule)
+    print(f"[INFO] teacher fusion: others 칸 조립 규칙 = {_others_rule}")
     teacher_feature_cache = []
     unlabeled_metadata_cache = []
 
@@ -397,17 +454,35 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
     _use_dkd = getattr(config, "use_dkd", False)
     _dkd_a = getattr(config, "dkd_alpha", 1.0)
     _dkd_b = getattr(config, "dkd_beta", 1.0)
+    # [변경 2026-08-17] alpha·T 를 하드코딩에서 config 로 뺐다. 값 자체는 그대로다
+    # (0.7 / 4.0 은 컨퍼런스 코드 mark3.2 에서 검증한 값이고 mark5 는 그 손실 구조를 물려받았다).
+    # mark4.x 가 쓰는 0.3 / 2.0 은 같은 샘플에 hard·soft 를 함께 거는 구조에서 soft 가 hard 를
+    # 굶긴 문제를 잡느라 내린 값이므로, labeled→hard / unlabeled→soft 로 나뉜 mark5 에는
+    # 그대로 옮겨오지 않는다. 다만 조정이 필요할 때 코드를 고치지 않고 config 만 바꾸도록 통로를 둔다.
+    _alpha = getattr(config, "distill_alpha", 0.7)
+    _temp = getattr(config, "distill_temperature", 4.0)
     criterion = DistillationLoss(
-        temperature=4.0, alpha=0.7,
+        temperature=_temp, alpha=_alpha,
         feature_kd_weight=config.feature_kd_weight if config.use_feature_kd else 0.0,
         use_dkd=_use_dkd, dkd_alpha=_dkd_a, dkd_beta=_dkd_b)
     print(f"[INFO] KD 모드: {'DKD' if _use_dkd else 'vanilla KD'}"
           + (f" (dkd_alpha={_dkd_a}, dkd_beta={_dkd_b}, 타겟축=teacher argmax)" if _use_dkd else "")
-          + f" | alpha=0.7, T=4.0, feature_kd={config.feature_kd_weight if config.use_feature_kd else 0.0}")
+          + f" | alpha={_alpha}, T={_temp}, feature_kd={config.feature_kd_weight if config.use_feature_kd else 0.0}")
     optimizer_params = list(student_encoder.parameters()) + list(student_branch.parameters())
     if background_embedding is not None:
         optimizer_params += list(background_embedding.parameters())
-    optimizer = optim.Adam(optimizer_params, lr=config.learning_rate)
+    # [변경 2026-08-17] weight_decay 와 LR 스케줄러를 mark4.x 와 같게 맞췄다.
+    # mark4.x 는 weight_decay 가 전무해 teacher 가 val best 를 epoch 5 에 찍고 곧장 과적합하던 것을
+    # 실측하고 1e-4 를 넣었고, ReduceLROnPlateau(factor 0.5, patience 3)도 함께 쓴다.
+    # mark5 에는 둘 다 없어서 학습 절차가 달랐고, 그러면 mark4.x 결과와 같은 표에 올릴 수 없다.
+    # [변경 2026-08-18] 기본값을 config 값(1e-4)과 같게 둔다. 0.0 이면 드라이브에 옛 config 가
+    # 올라갔을 때 정규화 없이 조용히 학습된다.
+    _weight_decay = getattr(config, "weight_decay", 1e-4)
+    optimizer = optim.Adam(optimizer_params, lr=config.learning_rate, weight_decay=_weight_decay)
+    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
+    _patience = getattr(config, "early_stopping_patience", 10)
+    print(f"[INFO] 학습 절차: weight_decay={_weight_decay}, ReduceLROnPlateau(factor=0.5, patience=3), "
+          f"early stopping patience={_patience}, best val 체크포인트 저장")
 
     train_hist, val_hist = [], []
     # [추가] train/val 직접 비교를 위해 컴포넌트별 손실 히스토리 분리 기록
@@ -420,11 +495,22 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
     train_bg_hist = []
     val_hard_hist = []
     print(f"[INFO] Student training ({mark_version}) started on {device}")
+    # [추가 2026-08-17] best val 체크포인트 + early stopping 상태
+    best_val = float("inf")
+    best_epoch = -1
+    no_improve = 0
+    stopped_early = False
+
     for epoch in range(config.num_epochs):
         student_encoder.train()
         student_branch.train()
         total_loss = total_hard_loss = total_soft_loss = total_feat_loss = 0.0
         total_bg_loss = 0.0
+        # [추가 2026-08-17] 캐시를 에폭마다 비운다. teacher 는 eval·no_grad·가중치 고정이라
+        # 같은 입력에 늘 같은 값을 내므로 에폭마다 쌓아봐야 같은 값이 num_epochs 벌 중복될 뿐이다.
+        # 그대로 두면 80 에폭에서 리스트가 1GB 넘게 불어나고 torch.cat 이 그만큼 사본을 또 만든다.
+        teacher_feature_cache.clear()
+        unlabeled_metadata_cache.clear()
 
         for mel_batch, label_batch, metadata_batch in train_loader:
             mel = mel_batch.to(device)
@@ -518,20 +604,43 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
 
         print(f"[Epoch {epoch+1}] Total {avg_loss:.4f} | Hard {avg_hard:.4f} | Soft {avg_soft:.4f} | Feat {avg_feat:.4f} | BG {avg_bg:.4f} | Val(hard*) {avg_val_hard:.4f}")
 
-    print("Training finished.")
-    save_checkpoint(
-        os.path.join(BASE_DIR, f"student_model_{mark_version}.pth"),
-        model_type="student_full",
-        mark_version=mark_version,
-        model_state=student_encoder.state_dict(),
-        branch_state=student_branch.state_dict(),
-        classifier_state=student_classifier.state_dict(),
-        background_state=background_embedding.state_dict() if background_embedding is not None else None,
-    )
-    if teacher_feature_cache:
-        torch.save(torch.cat(teacher_feature_cache, dim=0), get_feature_cache_path(PROJECT_ROOT, mark_version, "unlabeled_train"))
-    if unlabeled_metadata_cache:
-        torch.save(unlabeled_metadata_cache, get_metadata_cache_path(PROJECT_ROOT, mark_version, "unlabeled_train"))
+        # [추가 2026-08-17] LR 스케줄 · best 저장 · early stopping (mark4.x 와 같은 절차)
+        scheduler.step(avg_val)
+        if avg_val < best_val:
+            print(f"[EarlyStopping] Val loss {best_val:.6f} -> {avg_val:.6f}. Saving...")
+            best_val = avg_val
+            best_epoch = epoch + 1
+            no_improve = 0
+            save_checkpoint(
+                os.path.join(BASE_DIR, f"student_model_{mark_version}.pth"),
+                model_type="student_full",
+                mark_version=mark_version,
+                model_state=student_encoder.state_dict(),
+                branch_state=student_branch.state_dict(),
+                classifier_state=student_classifier.state_dict(),
+                background_state=background_embedding.state_dict() if background_embedding is not None else None,
+                # [추가 2026-08-17] config 를 넘겨 config_metadata 를 남긴다. 전에는 인자가 빠져 있어
+                # mark5 산출물만 provenance 가 빈 dict 였다(teacher 파일에는 10개가 들어 있다).
+                config=config,
+            )
+        else:
+            no_improve += 1
+            print(f"[EarlyStopping] counter: {no_improve}/{_patience}")
+            if no_improve >= _patience:
+                stopped_early = True
+                print(f"[INFO] Early stopping. best epoch {best_epoch} (val {best_val:.6f})")
+                break
+
+    print("Training finished."
+          + (f" (early stop, best epoch {best_epoch}/{config.num_epochs}, val {best_val:.6f})" if stopped_early
+             else f" (best epoch {best_epoch}/{config.num_epochs}, val {best_val:.6f})"))
+    # [변경 2026-08-18] 저장된 체크포인트가 없는 경우의 처리를 손실곡선 저장 뒤로 미룬다.
+    # 여기서 바로 raise 하면(예: val loss 가 첫 에폭부터 NaN 이라 한 번도 개선되지 않은 경우)
+    # 이번 수정으로 지키려던 손실 히스토리를 또 잃는다. 원인 분석에 필요한 것이 바로 그 곡선이다.
+    no_checkpoint = best_epoch < 0
+    if no_checkpoint:
+        print("[ERROR] val 이 한 번도 개선되지 않아 저장된 체크포인트가 없습니다. "
+              "손실 곡선만 저장하고 종료합니다(val loss 가 NaN 인지 확인하십시오).")
 
     plot_dir = os.path.join(PROJECT_ROOT, "plots")
     os.makedirs(plot_dir, exist_ok=True)
@@ -565,6 +674,30 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
                 train_feat_hist[i], train_bg_hist[i], val_hist[i], val_hard_hist[i],
             ])
     print(f"[INFO] 손실곡선 CSV 저장: {loss_history_csv}")
+
+    # [이동·수정 2026-08-17] teacher 특징·메타데이터 캐시 저장.
+    # 전에는 이 블록이 손실곡선 저장보다 앞에 있었고 cache 디렉터리를 아무도 만들지 않아서,
+    # 80 에폭을 다 돌고 여기서 "Parent directory ... does not exist" 로 죽으면서
+    # 손실곡선 PNG·CSV 를 통째로 잃었다(학습·체크포인트는 이미 끝난 뒤라 더 아깝다).
+    # 그래서 (1) 디렉터리를 만들고 (2) 진단용인 이 저장을 맨 뒤로 돌리고 (3) 실패해도
+    # 학습 결과를 잃지 않도록 경고만 남기고 넘어간다.
+    try:
+        cache_dir = os.path.join(PROJECT_ROOT, "cache", mark_version)
+        os.makedirs(cache_dir, exist_ok=True)
+        if teacher_feature_cache:
+            torch.save(torch.cat(teacher_feature_cache, dim=0), get_feature_cache_path(PROJECT_ROOT, mark_version, "unlabeled_train"))
+        if unlabeled_metadata_cache:
+            torch.save(unlabeled_metadata_cache, get_metadata_cache_path(PROJECT_ROOT, mark_version, "unlabeled_train"))
+        if teacher_feature_cache or unlabeled_metadata_cache:
+            print(f"[INFO] teacher 캐시 저장: {cache_dir} (마지막 에폭분)")
+    except Exception as e:
+        print(f"[WARN] teacher 캐시 저장 실패(학습 결과에는 영향 없음): {e}")
+
+    if no_checkpoint:
+        raise RuntimeError(
+            "[ERROR] val 이 한 번도 개선되지 않아 student_model 체크포인트가 없습니다. "
+            f"손실 곡선은 {plot_dir} 에 저장했습니다."
+        )
 
 
 if __name__ == "__main__":

@@ -31,17 +31,34 @@ class SimpleAudioEncoder(nn.Module):
             nn.MaxPool2d(kernel_size=2, stride=2)
         )
 
+        # [추가 2026-07-12 / 가설2] conv 2블록(32->64ch, 약 4.5만 파라미터)에서는 train hard
+        # loss가 랜덤 근처(~0.60)에 고착되어 훈련 데이터조차 못 맞추는 과소적합이 관찰됨.
+        # 용량 한계인지 진단하기 위해 3블록(32->64->128ch, 약 14.4만 파라미터)으로 확장.
+        # 여전히 엣지 배포 가능한 초경량 수준. 입력 64x101 -> 3회 MaxPool 후 8x12.
+        # 주의: 이 변경으로 기존 .pth 체크포인트와는 구조가 안 맞으므로 전체 재학습 필요.
+        #
+        # [Mark5 로 가져옴 2026-08-17] mark4.x 는 위 진단 뒤 3블록으로 갔는데 mark5 만 2블록으로
+        # 남아 있었다. mark5 는 2-class 가 아니라 9-class 라 더 어려운 문제인데 더 작은 인코더로
+        # 배우려던 셈이고, 효율성 표의 student 도 8개 버전과 다른 모델이 된다. 그래서 맞췄다.
+        self.conv_block3 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2)
+        )
+
         self.head = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.LayerNorm(64),
+            nn.LayerNorm(128),
             nn.Dropout(0.3),
-            nn.Linear(64, config.embedding_dim)
+            nn.Linear(128, config.embedding_dim)
         )
 
         self.model = nn.Sequential(
             self.conv_block1,
             self.conv_block2,
+            self.conv_block3,
             self.head
         )
 
@@ -115,6 +132,63 @@ class ResidualAudioEncoder(nn.Module):
         x = self.block2(x)
         x = F.relu(x + residual)
         return self.head(x)
+
+
+class TeacherAudioEncoder(nn.Module):
+    """
+    [추가 2026-07-13 / teacher 강화] teacher 전용 대형 인코더.
+
+    배경: 기존 teacher는 student와 완전히 같은 SimpleAudioEncoder(약 14.3만 파라미터)를 써서
+    KD인데도 teacher의 용량 우위가 전혀 없었음(teacher val loss가 가장 약한 고리였던 구조적 원인).
+    teacher는 엣지에 배포되지 않고 오프라인 soft label 생성에만 쓰이므로 크기 제약이 없다.
+
+    구조: conv 4블록(32->64->128->256) + 같은 head 구성. 약 49만 파라미터(student의 약 3.4배).
+    입력/출력 인터페이스는 SimpleAudioEncoder와 동일([B, C, 64, 101] -> [B, embedding_dim])이라
+    ViLDTextHead·Feature KD(384차원)와 그대로 호환된다. 입력 64x101 -> 4회 MaxPool 후 4x6.
+    주의: 기존 teacher .pth와 구조가 안 맞으므로 teacher부터 전체 재학습 필요.
+
+    [Mark5 로 가져옴 2026-08-17] Mark4.5/vild/vild_model.py:85 의 정의를 글자 그대로 복사한 것이다.
+    mark5 의 EnsembleTeacher 가 mark4.x teacher .pth 8개를 로드하는데, mark5 에는 이 클래스가
+    없어서 student 용 SimpleAudioEncoder 에 4블록 가중치를 넣으려다 실패했다
+    ("Missing key(s) conv_block1.* / Unexpected key(s) model.3.*"). 구조가 한 곳이라도
+    달라지면 다시 안 맞으므로 Mark4.5 원본과 동일하게 유지해야 한다.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        in_channels = getattr(config, "num_input_channels", 1)
+
+        def block(cin, cout):
+            return nn.Sequential(
+                nn.Conv2d(cin, cout, kernel_size=3, stride=1, padding=1),
+                nn.BatchNorm2d(cout),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=2, stride=2),
+            )
+
+        self.model = nn.Sequential(
+            block(in_channels, 32),
+            block(32, 64),
+            block(64, 128),
+            block(128, 256),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.LayerNorm(256),
+            nn.Dropout(0.3),
+            nn.Linear(256, config.embedding_dim),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+def build_teacher_encoder(config):
+    """teacher 인코더 선택 지점(단일 스위치). teacher_train.py와 extract_soft_labels.py가
+    반드시 같은 함수를 써야 체크포인트 구조가 일치한다.
+    config.use_large_teacher_encoder=False(또는 없음)면 기존 동작(SimpleAudioEncoder) 그대로."""
+    if getattr(config, "use_large_teacher_encoder", False):
+        return TeacherAudioEncoder(config)
+    return SimpleAudioEncoder(config)
 
 
 class ViLDTextHead(nn.Module):
