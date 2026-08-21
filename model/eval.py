@@ -71,12 +71,12 @@ def evaluate(mark_version: str, split: str = "test"):
 
     # [추가 2026-08-17] split 이 test 가 아니면 결과 파일명에 _{split} 을 붙여
     # test 결과를 덮어쓰지 않게 한다(mark4.x eval.py 의 out_tag 규칙과 동일).
-    out_tag = mark_version if split == "test" else f"{mark_version}_{split}"
+    out_tag = config.run_tag if split == "test" else f"{config.run_tag}_{split}"
 
     csv_path = _resolve_dataset_csv_path(split)
     print(f"[INFO] 평가 대상: split={split} · 인덱스={csv_path}")
     test_files = list(csv.DictReader(open(csv_path, newline="", encoding="utf-8")))
-    model_path = os.path.join(BASE_DIR, f"student_model_{mark_version}.pth")
+    model_path = os.path.join(BASE_DIR, f"student_model_{config.run_tag}.pth")
     checkpoint = load_checkpoint(model_path, map_location=device)
 
     encoder = build_audio_encoder(config).to(device)

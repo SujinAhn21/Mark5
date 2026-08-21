@@ -109,7 +109,7 @@ def save_visual_explanation(path, segment_records, segment_probs, segment_weight
     if not config.save_visual_explanations:
         return
 
-    explanation_dir = os.path.join(plot_dir, f"explanations_{config.mark_version}")
+    explanation_dir = os.path.join(plot_dir, f"explanations_{config.run_tag}")
     os.makedirs(explanation_dir, exist_ok=True)
     order = np.argsort(segment_weights)[::-1][:config.explain_topk_segments]
     fig, axes = plt.subplots(len(order), 1, figsize=(10, 3 * len(order)))

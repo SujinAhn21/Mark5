@@ -123,10 +123,19 @@ class AudioViLDConfig:
         # mark4_refactored/vild/vild_config.py의 동일 property 주석 참조).
         # mark5(9-class)는 기존 하드코딩값(0.82)이 우연히 confidence_threshold(0.45)와 거의
         # 같은 엄격도(top_conf≈0.47 지점)였어서 이 변경으로도 동작이 거의 그대로 유지된다.
-        self.class_pair_margin_overrides = {
-            ("water_toilet", "water_shower"): 0.03,
-            ("construction", "machine_noise"): 0.03,
-        }
+        # [비활성 2026-08-21] class-pair 보정을 끈다(빈 dict = 아무 짝도 손대지 않음).
+        # 이 보정은 두 클래스의 확률 격차가 threshold(0.03) 미만이면 둘을 평균내 동점으로
+        # 만드는데, 동점은 margin=0 이라 바로 뒤 others 보정(margin<0.05 면 others 강제,
+        # postprocess_utils.py:38)에 반드시 걸린다. 즉 이 보정이 예측을 실제로 바꾸는 경우
+        # (그 짝이 top-2 인 경우)마다 그 결정이 others 로 덮여, 결정 기구로서는 죽어 있었다.
+        # 게다가 동점을 argmax 로 풀면 클래스 목록에서 인덱스가 앞선 쪽(construction,
+        # water_toilet)이 항상 이기는데, 이건 측정으로 정한 우선순위가 아니라 코드에 적힌 순서다.
+        # 끄는 결정적 이유는 스윕 오염이다. 보정이 걸린 클립은 prediction_details CSV 의
+        # Raw Margin 이 실제 값(0.03 미만의 어떤 값)이 아니라 인위적인 0 으로 기록되어,
+        # 나중에 others margin 임계값을 0~0.03 구간에서 스윕할 때 정작 제일 궁금한 짝 클래스
+        # 구간의 숫자를 믿을 수 없게 된다. 빈 dict 면 apply_class_pair_calibration 이
+        # 루프를 한 번도 안 돌고 입력을 그대로 반환한다.
+        self.class_pair_margin_overrides = {}
         self.enable_temporal_smoothing = True
         self.temporal_smoothing_alpha = 0.65
         self.enable_abstention = False
@@ -222,6 +231,22 @@ class AudioViLDConfig:
         """
         # 평가용 클래스 목록을 사용하도록 변경
         return {class_name: i for i, class_name in enumerate(self.get_classes_for_evaluation())}
+
+    @property
+    def run_tag(self) -> str:
+        """[신설 2026-08-21] 산출물 파일명에 붙일 실행 태그.
+
+        1차(vanilla KD)와 2차(DKD)가 같은 이름으로 저장돼 서로를 덮는 문제를 막는다.
+        use_dkd=False 면 mark_version 그대로라 1차 파일명은 하나도 바뀌지 않고,
+        True 로 바꾸는 순간 student 체크포인트 · 손실곡선 PNG · loss_history CSV ·
+        혼동행렬 · ROC · performance_summary · calibration_details ·
+        prediction_details · 설명 PNG 폴더가 전부 _DKD 로 갈린다.
+
+        일부러 태그를 안 붙이는 것: cache/{mark_version}/ 의 teacher feature 캐시
+        (teacher 출력은 DKD 와 무관해서 2차가 1차 캐시를 재사용하는 편이 빠르다),
+        resources/ 의 teacher .pth, dataset_*.csv 인덱스.
+        """
+        return f"{self.mark_version}_DKD" if self.use_dkd else self.mark_version
 
     @property
     def others_entropy_threshold(self) -> float:

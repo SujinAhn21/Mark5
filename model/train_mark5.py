@@ -612,7 +612,7 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
             best_epoch = epoch + 1
             no_improve = 0
             save_checkpoint(
-                os.path.join(BASE_DIR, f"student_model_{mark_version}.pth"),
+                os.path.join(BASE_DIR, f"student_model_{config.run_tag}.pth"),
                 model_type="student_full",
                 mark_version=mark_version,
                 model_state=student_encoder.state_dict(),
@@ -656,15 +656,15 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
     plt.plot(val_hard_hist, label="Val Hard (raw CE)", linewidth=2)
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
-    plt.title(f"Student Loss ({mark_version})\n* 직접 비교는 Train Hard vs Val Hard (동일 raw CE) 기준")
+    plt.title(f"Student Loss ({config.run_tag})\n* 직접 비교는 Train Hard vs Val Hard (동일 raw CE) 기준")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig(os.path.join(plot_dir, f"loss_curve_student_{mark_version}.png"))
+    plt.savefig(os.path.join(plot_dir, f"loss_curve_student_{config.run_tag}.png"))
 
     # [추가] 손실곡선 raw 숫자를 CSV로도 저장. PNG만 있으면 다른 모델(CED-Tiny 등)과
     # 겹쳐 그리는 비교 그래프를 다시 만들 수 없어서, 비교 실험용으로 숫자 그대로 남긴다.
-    loss_history_csv = os.path.join(plot_dir, f"loss_history_{mark_version}.csv")
+    loss_history_csv = os.path.join(plot_dir, f"loss_history_{config.run_tag}.csv")
     with open(loss_history_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["epoch", "train_total", "train_hard", "train_soft", "train_feat", "train_bg", "val_total", "val_hard"])
