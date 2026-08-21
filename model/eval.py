@@ -109,6 +109,14 @@ def evaluate(mark_version: str, split: str = "test"):
         else:
             print("[WARN] background_state_dict가 없어 background embedding 없이 평가합니다. 새 모델 재학습이 권장됩니다.")
 
+    # [신설 2026-08-22] background embedding 을 others 로짓에 max 로 덮을지 여부.
+    # 기본 False. 켜져 있던 1차 평가에서 430클립 중 417개가 others 로 쏠렸다(자세한 근거는
+    # vild_config.py 의 use_background_override_at_eval 주석).
+    use_bg_override = getattr(config, "use_background_override_at_eval", False)
+    if background_embedding is not None:
+        print(f"[INFO] background override: {'적용' if use_bg_override else '미적용'} "
+              f"(others 로짓을 background embedding 으로 max 덮어쓰기)")
+
     encoder.eval()
     branch_head.eval()
     text_head.eval()
@@ -146,7 +154,7 @@ def evaluate(mark_version: str, split: str = "test"):
                 sup_logits = text_head(supervised_features, text_emb)
                 distill_logits = text_head(distill_features, text_emb)
 
-                if background_embedding is not None:
+                if background_embedding is not None and use_bg_override:
                     others_idx = class_names.index("others")
                     bg_norm = F.normalize(background_embedding(), dim=0)
 

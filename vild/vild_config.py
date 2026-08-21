@@ -81,6 +81,31 @@ class AudioViLDConfig:
         self.use_background_embedding = True
         # [추가] background embedding 보조 loss 가중치 (use_background_embedding=True일 때만 의미 있음)
         self.background_embedding_weight = 0.1
+        # [신설 2026-08-22] 평가에서 others 로짓에 background embedding 을 max 로 덮어쓸지 여부.
+        # False 가 기본이다(=덮어쓰지 않는다).
+        #
+        # 1차 학습(val 430) 결과에서 accuracy 0.1209 인데 ROC AUC 는 0.8871 이 나와 원인을 추적한
+        # 결과 이 override 였다. prediction_details CSV 실측: 430클립 중 417개(97.0%)에서 others 가
+        # 1등이었고, others 가 아닌 383개 중 316개(82.5%)는 정답이 정확히 2등이었다. others 열을
+        # 빼고 argmax 만 다시 계산하면 8클래스 정확도가 0.859 였다. 즉 모델은 제대로 배웠는데
+        # others 하나가 모든 클립 위에 일률적으로 얹혀 있었다(Prob_others 평균 0.81, 정답이
+        # others 인 클립 0.95 와 거의 차이가 없음).
+        #
+        # 구조상 그럴 수밖에 없다. 학습(train_mark5.py:533)은 background 를 others 샘플 feature 의
+        # 평균 방향으로 당기는 보조 loss 만 걸고 **분류 로짓에는 넣지 않는다.** 그런데 평가만
+        # others_logit = max(text_logit, cos(feature, bg)/logit_temperature) 로 덮었다. max 라
+        # others 를 올리기만 하고 내리지는 못하는데다, 같은 인코더가 뽑은 feature 라 다른 클래스도
+        # bg 와 방향이 겹치고, logit_temperature(0.07)로 나누면서 14.3배로 증폭된다.
+        # (학습 종료 시 bg_loss 0.1040 = cos(others feature, bg) 약 0.896.)
+        #
+        # mark4.8 이 2026-07-12 에 잡은 background embedding override 와 같은 물건이다. 다만
+        # 거기서는 Hard loss 가 랜덤 근처에서 안 움직여 "학습부터 꺼야 한다"는 결론이었고,
+        # mark5 는 override 가 평가에만 있어 Hard loss 가 1.396->0.495 로 정상 수렴했다.
+        # 그래서 재학습 없이 평가만 다시 돌리면 된다.
+        #
+        # 보조 loss 자체(use_background_embedding)는 끄지 않는다. others feature 를 한 방향으로
+        # 모으는 것은 해롭지 않고, 파괴적인 것은 평가 시점의 max 덮어쓰기뿐이다.
+        self.use_background_override_at_eval = False
         self.use_text_aligned_student = True
         self.use_feature_kd = True
         self.feature_kd_weight = 0.3
