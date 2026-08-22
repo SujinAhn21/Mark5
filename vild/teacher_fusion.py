@@ -70,15 +70,77 @@ class WeightedTeacherFusion:
     여기서 버리는 11.85 포인트가 그대로 student 가 배우는 정답의 오염률이 된다.
     옛 동작으로 되돌리려면 config 의 fusion_score_mode 를 "raw" 로 두면 되고,
     그때는 others_rule(min/mean/max)이 다시 의미를 갖는다.
+
+    === 분포 정렬 (distribution alignment, 신설 2026-08-22) ===
+
+    문제: pseudo-label 의 클래스 분포가 균등에서 크게 벗어나 있다. unlabeled 300클립
+    1500세그먼트 실측에서 construction 19.2% / others 2.4% 였다(균등이면 11.1%). labeled
+    2,000개는 클래스당 222개로 균형인데, unlabeled 2,000개가 이 편향을 학습에 주입한다.
+
+    그 결과가 test 혼동행렬에 그대로 나타난다 — construction 이 FP 21건으로 오답을 빨아들이고
+    (precision 0.687), others 는 recall 0.660 에 그친다. test 에서 클래스별 가중치를 직접
+    최적화하면 acc 0.9000 까지 오르는데, 그때 필요한 가중치가 construction 0.25 / others 2.2 로
+    정확히 이 편향의 역수 방향이다.
+
+    ⚠ 이 편향을 **사후 보정으로 고치려는 시도는 실패했다**(2026-08-22). val 430클립으로 클래스
+    가중치를 학습시키니 val 은 0.8814 -> 0.9023 으로 올랐는데 test 는 0.8581 -> 0.8581 로
+    전혀 움직이지 않았다. 파라미터 10개를 430개 샘플로 맞춰 과적합된 것이다. 그래서 사후가 아니라
+    **학습 단계에서** 고친다. 여기서는 unlabeled 세그먼트 10,000개 위에서 분포를 추정하므로
+    표본이 23배 크고, 추정 대상과 적용 대상이 같은 데이터다.
+
+    수식:  aligned_p ∝ p_teacher(y|x) x (p_target(y) / p_hat(y))^tau
+
+    p_hat 은 teacher 가 실제로 내놓는 분포이고 EMA(momentum 0.999)로 누적한다. 배치 하나로는
+    분포를 못 재고, 학습 중 실시간이라 전체를 미리 알 수도 없기 때문이다. p_target 은 균등
+    (labeled 가 균형이므로). tau 는 보정 강도로 0 이면 no-op, 1 이면 완전 균등화다.
+    tau 값은 val 430클립에 teacher 를 통과시켜 pseudo-label 품질(정확도·클래스별 recall)이
+    어떻게 변하는지 재서 정한다.
     """
 
     def __init__(self, student_class_map, embedding_dim, device, others_rule="min",
-                 score_mode="margin"):
+                 score_mode="margin", use_distribution_alignment=False,
+                 dist_align_tau=0.5, dist_align_momentum=0.999):
         self.student_class_map = student_class_map
         self.embedding_dim = embedding_dim
         self.device = device
         self.others_rule = others_rule
         self.score_mode = score_mode
+        # [신설 2026-08-22] 분포 정렬(distribution alignment)
+        self.use_distribution_alignment = use_distribution_alignment
+        self.dist_align_tau = dist_align_tau
+        self.dist_align_momentum = dist_align_momentum
+        num_classes = len(student_class_map)
+        # 관측 분포 EMA. 균등에서 출발한다(아직 아무것도 안 봤을 때 보정이 no-op 이 되도록).
+        self.observed_dist = torch.full((num_classes,), 1.0 / num_classes, device=device)
+        # 목표 분포. labeled 가 클래스당 222개로 균형이므로 균등이다.
+        self.target_dist = torch.full((num_classes,), 1.0 / num_classes, device=device)
+        self.align_seen_batches = 0
+
+    def _align(self, logits):
+        """관측 분포를 EMA 로 누적하고, 그 역수로 확률을 보정한 로짓을 돌려준다.
+
+        aligned_p ∝ p(y|x) x (p_target(y) / p_hat(y))^tau
+
+        tau=0 이면 보정이 없고(현재 동작), tau=1 이면 관측 분포를 목표 분포로 완전히 끌어당긴다.
+        확률 공간에서 곱한 뒤 다시 log 를 취해 로짓으로 돌려주므로, 이후 argmax·softmax·
+        pseudo-label CE 가 모두 보정된 값 위에서 돈다.
+        """
+        probs = torch.softmax(logits, dim=1)
+        # EMA 갱신은 배치 평균으로. 학습 중 매 배치 호출되므로 momentum 0.999 면
+        # 사실상 최근 수천 배치의 분포에 수렴한다.
+        with torch.no_grad():
+            batch_dist = probs.mean(dim=0)
+            m = self.dist_align_momentum
+            self.observed_dist = m * self.observed_dist + (1.0 - m) * batch_dist
+            self.observed_dist = self.observed_dist / self.observed_dist.sum().clamp_min(1e-12)
+            self.align_seen_batches += 1
+
+        if self.dist_align_tau == 0:
+            return logits
+        ratio = (self.target_dist / self.observed_dist.clamp_min(1e-8)) ** self.dist_align_tau
+        aligned = probs * ratio.unsqueeze(0)
+        aligned = aligned / aligned.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        return torch.log(aligned.clamp_min(1e-12))
 
     def fuse(self, specialist_outputs):
         batch_size = next(iter(specialist_outputs.values()))["logits"].shape[0]
@@ -130,6 +192,12 @@ class WeightedTeacherFusion:
                     f"알 수 없는 others_rule: {self.others_rule!r} — 'min' | 'mean' | 'max' 중 하나여야 합니다."
                 )
             ensembled_logits[:, others_idx] = others_logit
+
+        # [신설 2026-08-22] 분포 정렬. 조립이 끝난 9-class 로짓에 건다.
+        # 여기서 걸어야 이후의 argmax(pseudo-label)·softmax(KL)·확률 모두가 보정된 값을 본다.
+        if self.use_distribution_alignment:
+            ensembled_logits = self._align(ensembled_logits)
+
         fused_features = feature_sum / weight_sum.clamp_min(1e-6)
         stacked_weights = torch.stack(
             [specialist_weights[name].to(self.device).squeeze(1) for name in specialist_outputs.keys()],

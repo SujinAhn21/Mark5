@@ -243,6 +243,25 @@ class AudioViLDConfig:
         self.distill_branch_classify = True
         # distill branch 마지막 ReLU. 기본은 뺀다(근거는 vild/vild_head.py docstring).
         self.distill_branch_final_relu = False
+
+        # === [신설 2026-08-22] 분포 정렬 (distribution alignment) ===
+        # pseudo-label 의 클래스 분포가 균등에서 벗어난 것을 학습 단계에서 잡는다.
+        # 실측(unlabeled 300클립 1500세그먼트): construction 19.2% / others 2.4% (균등 11.1%).
+        # 그 편향이 test 혼동행렬에 그대로 — construction FP 21건(precision 0.687),
+        # others recall 0.660. test 에서 클래스 가중치를 직접 최적화하면 acc 0.9000 까지 오르고
+        # 그때 필요한 가중치가 construction 0.25 / others 2.2 로 이 편향의 역수 방향이다.
+        #
+        # ⚠사후 보정은 이미 실패했다 — val 430클립으로 클래스 가중치를 맞추니 val 은
+        # 0.8814 -> 0.9023 인데 test 는 0.8581 -> 0.8581 로 전혀 안 움직였다(파라미터 10개를
+        # 430샘플로 맞춰 과적합). 그래서 학습 단계에서 고친다. 여기서는 unlabeled 세그먼트
+        # 10,000개 위에서 분포를 추정하므로 표본이 23배 크고 추정·적용 대상이 같다.
+        self.use_distribution_alignment = True
+        # 보정 강도. 0=no-op(현재 동작), 1=완전 균등화.
+        # ⚠기본 0.5 는 아직 측정으로 정한 값이 아니다. val 430클립에 teacher 를 통과시켜
+        # pseudo-label 품질을 재고 확정할 것.
+        self.dist_align_tau = 0.5
+        # 관측 분포 EMA. 0.999 면 최근 수천 배치의 분포에 수렴한다.
+        self.dist_align_momentum = 0.999
         self.text_loss_weight = 1.0
         self.image_loss_weight = 1.0
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -314,6 +333,7 @@ class AudioViLDConfig:
             (없음) : 1차 학습과 완전히 같은 설정 — vanilla KD, raw 조립
             _PL    : use_pseudo_label_ce=True  (unlabeled 를 KL 대신 pseudo-label CE 로)
             _RAW   : fusion_score_mode="raw"   (PL 을 쓰면서 옛 조립으로 되돌린 경우만)
+            _DA<t> : use_distribution_alignment=True (t = tau 를 소수점 없이, 예: tau 0.5 -> _DA05)
             _DKD   : use_dkd=True
 
         태그가 갈리는 산출물: student 체크포인트 · 손실곡선 PNG · loss_history CSV ·
@@ -330,6 +350,10 @@ class AudioViLDConfig:
             tag += "_PL"
             if getattr(self, "fusion_score_mode", "margin") == "raw":
                 tag += "_RAW"
+        if getattr(self, "use_distribution_alignment", False):
+            # tau 를 태그에 넣는다. tau 를 바꿔가며 돌릴 때 산출물이 서로를 덮지 않게.
+            _t = getattr(self, "dist_align_tau", 0.5)
+            tag += "_DA" + f"{_t:g}".replace(".", "")
         if self.use_dkd:
             tag += "_DKD"
         return tag

@@ -107,13 +107,18 @@ def _align_teacher_arch(config, state_dict, class_name, ckpt_name):
 
 
 class EnsembleTeacher:
-    def __init__(self, specialist_config, device, others_rule="min", score_mode="margin"):
+    def __init__(self, specialist_config, device, others_rule="min", score_mode="margin",
+                 use_distribution_alignment=False, dist_align_tau=0.5, dist_align_momentum=0.999):
         self.device = device
         self.specialists = {}
         self.embedding_dim = None
         self.fusion = None  # WeightedTeacherFusion은 배치마다 재생성하지 않고 1회 생성 후 재사용
         self.others_rule = others_rule  # [추가 2026-08-18] fusion 의 others 칸 조립 규칙
         self.score_mode = score_mode    # [추가 2026-08-22] 담당 칸 점수: "raw" | "margin"
+        # [추가 2026-08-22] 분포 정렬. fusion 을 1회 생성해 재사용하므로 EMA 상태가 학습 내내 유지된다.
+        self.use_distribution_alignment = use_distribution_alignment
+        self.dist_align_tau = dist_align_tau
+        self.dist_align_momentum = dist_align_momentum
         for class_name, paths in specialist_config.items():
             encoder_ckpt = load_checkpoint(_resolve_resource_path(paths["encoder_path"]), map_location=device)
             config = AudioViLDConfig(mark_version=paths["mark_version"])
@@ -164,6 +169,9 @@ class EnsembleTeacher:
                 student_class_map, self.embedding_dim, self.device,
                 others_rule=self.others_rule,
                 score_mode=self.score_mode,
+                use_distribution_alignment=self.use_distribution_alignment,
+                dist_align_tau=self.dist_align_tau,
+                dist_align_momentum=self.dist_align_momentum,
             )
         return self.fusion.fuse(fusion_inputs)
 
@@ -474,12 +482,21 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
     }
     _others_rule = getattr(config, "fusion_others_rule", "min")
     _score_mode = getattr(config, "fusion_score_mode", "margin")
+    _use_da = getattr(config, "use_distribution_alignment", False)
+    _da_tau = getattr(config, "dist_align_tau", 0.5)
+    _da_mom = getattr(config, "dist_align_momentum", 0.999)
     ensemble_teacher = EnsembleTeacher(specialist_config, device,
-                                       others_rule=_others_rule, score_mode=_score_mode)
+                                       others_rule=_others_rule, score_mode=_score_mode,
+                                       use_distribution_alignment=_use_da,
+                                       dist_align_tau=_da_tau, dist_align_momentum=_da_mom)
     if _score_mode == "margin":
         print("[INFO] teacher fusion: 담당 칸 = margin(target-others), others 칸 = -max(margin)")
     else:
         print(f"[INFO] teacher fusion: 담당 칸 = raw logit, others 칸 조립 규칙 = {_others_rule}")
+    if _use_da:
+        print(f"[INFO] 분포 정렬: 적용 (tau={_da_tau}, EMA momentum={_da_mom}, 목표=균등)")
+    else:
+        print("[INFO] 분포 정렬: 미적용")
     teacher_feature_cache = []
     unlabeled_metadata_cache = []
 
