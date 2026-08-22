@@ -255,31 +255,65 @@ class AudioViLDConfig:
         # 0.8814 -> 0.9023 인데 test 는 0.8581 -> 0.8581 로 전혀 안 움직였다(파라미터 10개를
         # 430샘플로 맞춰 과적합). 그래서 학습 단계에서 고친다. 여기서는 unlabeled 세그먼트
         # 10,000개 위에서 분포를 추정하므로 표본이 23배 크고 추정·적용 대상이 같다.
-        self.use_distribution_alignment = True
+        # ★[결론 2026-08-23] 끈다. 재학습으로 검증한 결과 student 성능이 개선되지 않았다.
+        #
+        # 1) teacher 는 확실히 좋아졌다. val 430클립에 teacher 를 통과시킨 스윕
+        #    (model/sweep_dist_align.py):
+        #      tau    off     0.25    0.5     0.75    1.0
+        #      acc    0.8744  0.8860  0.8860  0.8930  0.8977   (+2.33%p)
+        #      othR   0.362   0.404   0.404   0.426   0.447    (+8.5%p)
+        #      균등L1  0.1736  0.1550  0.1550  0.1354  0.1261
+        #    실측 편향(teacher 관측 분포, 균등 = 0.1111):
+        #      construction 0.1479(x0.75) · machine_noise 0.1479(x0.75) · others 0.0539(x2.06)
+        #
+        # 2) 그런데 tau=1.0 으로 재학습한 student 는 나아지지 않았다. 각자의 최적 others
+        #    임계값에서 공정 비교한 val 430 결과:
+        #      PL       acc 0.8814 / macroF1 0.8807  (thr 0.14)
+        #      PL+DA1   acc 0.8791 / macroF1 0.8772  (thr 0.11)
+        #    차이가 1클립이고, 정답이 top-2 안에 드는 비율은 0.9442 로 **완전히 같다**.
+        #    바뀐 것은 클래스 배분뿐이다 — others +0.128(0.787->0.915) 를 얻고
+        #    machine_noise -0.083(0.750->0.667) 을 잃어 총합이 상쇄됐다.
+        #
+        # 3) 왜 전달되지 않았나: student 가 이미 teacher 와 같은 수준이었다
+        #    (student 0.8814 vs teacher 0.8744). 선생이 좋아져도 학생이 이미 그만큼 하고 있으면
+        #    배울 것이 없다. 게다가 teacher 신호는 alpha=0.3 으로 가중되고 나머지 0.7 은
+        #    labeled hard CE 다. 같은 이유로 DKD 도 접었다(2026-08-23).
+        #
+        # 코드는 남겨둔다. teacher 와 student 의 격차가 큰 상황(예: labeled 를 크게 줄인
+        # 저라벨 실험)에서는 다시 의미가 생길 수 있고, 그때 True 로 켜면 된다.
+        self.use_distribution_alignment = False
         # 보정 강도. 0=no-op, 1=관측 분포를 목표 분포로 완전 정렬.
-        #
-        # [확정 2026-08-22] tau=1.0. val 430클립(2150세그먼트)에 teacher 를 통과시켜
-        # model/sweep_dist_align.py 로 스윕한 결과 정확도가 단조 증가했다.
-        #     tau   off    0.25    0.5    0.75    1.0
-        #     acc   0.8744 0.8860 0.8860 0.8930 0.8977
-        #     othR  0.362  0.404  0.404  0.426  0.447
-        #     균등L1 0.1736 0.1550 0.1550 0.1354 0.1261
-        # teacher pseudo-label 정확도가 0.8744 -> 0.8977(+2.33%p), others recall 이
-        # 0.362 -> 0.447(+8.5%p) 오르고 construction 은 1.000 을 유지한다.
-        # 개선의 최대 기여는 water_toilet 0.792 -> 0.938(+14.6%p)인데, 이것이 test 혼동행렬의
-        # 최대 오분류(water_toilet -> construction 8건)와 정확히 같은 자리다.
-        #
-        # 실측된 편향(val, teacher 관측 분포 p_hat):
-        #   construction 0.1479(x0.75) · machine_noise 0.1479(x0.75) · water_shower 0.1243(x0.89)
-        #   others 0.0539(x2.06) · water_toilet 0.0883(x1.26)   (균등 = 0.1111)
-        #
-        # 1.0 을 고른 이유: 정확도 최고이고 0.75 와 차이가 작아 봉우리가 완만하다. 그리고
-        # "관측 분포를 목표 분포로 완전히 정렬"이라는 이론적 기준점이라 임의값이 아니다.
-        # ⚠이것은 teacher pseudo-label 의 품질이지 student 성능이 아니다. student 개선 여부는
-        # 재학습으로만 확인된다. 재학습 후에는 이 스윕을 다시 돌려 tau 를 재확인할 것.
+        # 1.0 은 위 스윕에서 teacher 품질이 최고였던 값이라 켤 때의 기본값으로 남겨둔다.
         self.dist_align_tau = 1.0
         # 관측 분포 EMA. 0.999 면 최근 수천 배치의 분포에 수렴한다.
         self.dist_align_momentum = 0.999
+
+        # === [신설 2026-08-23] SpecAugment (학습 시 온라인 증강) ===
+        # mel 배치의 주파수 대역·시간 구간을 무작위로 가린다. 학습 루프에서만 걸리고
+        # (Dataset 은 파싱 결과를 초기화 때 고정하므로 파서에 넣으면 epoch 마다 같은 마스크가
+        # 나와 증강이 아니게 된다), val 루프와 eval.py 는 원본을 그대로 본다.
+        #
+        # 왜: (1) 클래스당 학습 클립이 222개뿐이라 결정 경계가 얇다 — test 에서 오답의
+        # 대부분(53클립)이 "정답이 2위"였다. 마스킹은 한 가지 단서에 매달리는 지름길을 막아
+        # 그 경계를 두껍게 만드는 표준 기법이다(SpecAugment, Park et al. 2019).
+        # (2) 증강이 없으면 teacher 가 같은 입력에 늘 같은 값을 내므로 online KD 가
+        # offline 과 수치적으로 동일했다(train_mark5.py 의 캐시 주석이 스스로 밝히던 사실).
+        # 증강이 들어가면 매 epoch 다른 view 가 teacher 에 들어가 실시간 재계산이 실제로
+        # 의미를 갖는다.
+        self.use_spec_augment = True
+        # 보수적인 표준 강도. 64 mel 중 최대 8칸짜리 주파수 마스크 2개,
+        # 101 프레임 중 최대 16칸짜리 시간 마스크 2개.
+        self.spec_augment_freq_mask_param = 8
+        self.spec_augment_num_freq_masks = 2
+        self.spec_augment_time_mask_param = 16
+        self.spec_augment_num_time_masks = 2
+        # teacher 가 어느 view 를 보는가.
+        #   "augmented" : student 와 같은 증강 view (기본) — 진짜 online. 증강마다 pseudo-label 이
+        #                 재계산되고, 가려진 view 에서 앙상블 합의가 깨지는 클립은 선별
+        #                 (pseudo_label_min_confidence)이 걸러낸다.
+        #   "clean"     : teacher 는 원본, student 만 증강 view (FixMatch 식 일관성 정규화) —
+        #                 pseudo-label 품질(0.894)이 보존되는 안전한 대안.
+        self.spec_augment_teacher_view = "augmented"
         self.text_loss_weight = 1.0
         self.image_loss_weight = 1.0
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -351,6 +385,7 @@ class AudioViLDConfig:
             (없음) : 1차 학습과 완전히 같은 설정 — vanilla KD, raw 조립
             _PL    : use_pseudo_label_ce=True  (unlabeled 를 KL 대신 pseudo-label CE 로)
             _RAW   : fusion_score_mode="raw"   (PL 을 쓰면서 옛 조립으로 되돌린 경우만)
+            _SA    : use_spec_augment=True     (학습 시 SpecAugment 온라인 증강)
             _DA<t> : use_distribution_alignment=True (t = tau 를 소수점 없이, 예: tau 0.5 -> _DA05)
             _DKD   : use_dkd=True
 
@@ -368,6 +403,8 @@ class AudioViLDConfig:
             tag += "_PL"
             if getattr(self, "fusion_score_mode", "margin") == "raw":
                 tag += "_RAW"
+        if getattr(self, "use_spec_augment", False):
+            tag += "_SA"
         if getattr(self, "use_distribution_alignment", False):
             # tau 를 태그에 넣는다. tau 를 바꿔가며 돌릴 때 산출물이 서로를 덮지 않게.
             _t = getattr(self, "dist_align_tau", 0.5)

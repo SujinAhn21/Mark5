@@ -364,6 +364,44 @@ class DistillationLoss(nn.Module):
         return total, hard_loss, soft_loss, feat_loss
 
 
+def apply_spec_augment(mel_batch, num_freq_masks, freq_mask_param,
+                       num_time_masks, time_mask_param):
+    """SpecAugment(Park et al. 2019) — mel 배치의 주파수 대역·시간 구간을 무작위로 가린다.
+
+    [신설 2026-08-23]
+
+    입력: [B, C, n_mels, T]. 채널(mel·delta1·delta2)은 같은 위치를 함께 가린다 —
+    같은 소리의 세 가지 표현이므로 위치가 어긋나면 가린 정보가 다른 채널로 샌다.
+
+    ⚠마스크 값은 0 이 아니라 **그 샘플·그 채널의 평균**이다. 우리 mel 은 AmplitudeToDB 를
+    거친 dB 스케일이고 별도 정규화가 없어서, 0 은 "무음"이 아니라 상당히 큰 소리다.
+    0 으로 가리면 조용한 배경 위에 밝은 띠를 그려넣는 셈이 된다. 평균으로 채우면
+    "정보만 지운다"에 가깝다.
+
+    난수는 torch 전역 시드(42)를 따른다. 학습 루프에서만 호출할 것 — val 루프와 eval.py 는
+    원본을 그대로 본다.
+    """
+    if mel_batch.dim() != 4:
+        return mel_batch
+    B, _, n_mels, n_frames = mel_batch.shape
+    out = mel_batch.clone()
+    fill = mel_batch.mean(dim=(2, 3), keepdim=True)      # [B, C, 1, 1] 채널별 평균
+    for b in range(B):
+        for _ in range(num_freq_masks):
+            f = int(torch.randint(0, freq_mask_param + 1, (1,)).item())
+            if f == 0 or f >= n_mels:
+                continue
+            f0 = int(torch.randint(0, n_mels - f + 1, (1,)).item())
+            out[b, :, f0:f0 + f, :] = fill[b, :, 0, 0].view(-1, 1, 1)
+        for _ in range(num_time_masks):
+            t = int(torch.randint(0, time_mask_param + 1, (1,)).item())
+            if t == 0 or t >= n_frames:
+                continue
+            t0 = int(torch.randint(0, n_frames - t + 1, (1,)).item())
+            out[b, :, :, t0:t0 + t] = fill[b, :, 0, 0].view(-1, 1, 1)
+    return out
+
+
 def _stable_file_split(path, val_ratio=0.1):
     """[폴백 전용 / 2026-08-09] dataset_val.csv 가 없을 때만 쓰는 옛 방식.
 
@@ -497,6 +535,19 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
         print(f"[INFO] 분포 정렬: 적용 (tau={_da_tau}, EMA momentum={_da_mom}, 목표=균등)")
     else:
         print("[INFO] 분포 정렬: 미적용")
+    # [추가 2026-08-23] SpecAugment 설정
+    _use_sa = getattr(config, "use_spec_augment", False)
+    _sa_f = getattr(config, "spec_augment_freq_mask_param", 8)
+    _sa_nf = getattr(config, "spec_augment_num_freq_masks", 2)
+    _sa_t = getattr(config, "spec_augment_time_mask_param", 16)
+    _sa_nt = getattr(config, "spec_augment_num_time_masks", 2)
+    _sa_teacher_view = getattr(config, "spec_augment_teacher_view", "augmented")
+    if _use_sa:
+        print(f"[INFO] SpecAugment: 적용 (주파수 {_sa_nf}x최대{_sa_f}/{config.n_mels}칸, "
+              f"시간 {_sa_nt}x최대{_sa_t}/{config.segment_length}프레임, "
+              f"teacher view={_sa_teacher_view}) — 학습에만, val/eval 은 원본")
+    else:
+        print("[INFO] SpecAugment: 미적용")
     teacher_feature_cache = []
     unlabeled_metadata_cache = []
 
@@ -592,6 +643,9 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
 
             if labeled_indices:
                 labeled_mel = mel[labeled_indices]
+                # [추가 2026-08-23] SpecAugment. 정답 라벨은 그대로 두고 입력만 가린다.
+                if _use_sa:
+                    labeled_mel = apply_spec_augment(labeled_mel, _sa_nf, _sa_f, _sa_nt, _sa_t)
                 labeled_targets = torch.tensor([student_label_map[label_batch[i]] for i in labeled_indices], dtype=torch.long, device=device)
                 base_features = student_encoder(labeled_mel)
                 supervised_features, _ = student_branch(base_features)
@@ -612,7 +666,20 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
 
             if unlabeled_indices:
                 unlabeled_mel = mel[unlabeled_indices]
-                fusion_output = ensemble_teacher(unlabeled_mel, student_label_map)
+                # [추가 2026-08-23] SpecAugment. teacher view 는 config 로 갈린다.
+                #   augmented: teacher 도 증강 view 를 본다 — 진짜 online. 증강마다
+                #              pseudo-label 이 재계산되고, 가려진 view 에서 앙상블 합의가
+                #              깨지는 세그먼트는 아래 선별(keep_mask)이 걸러낸다.
+                #   clean    : teacher 는 원본을 보고 student 만 증강 view 를 본다
+                #              (FixMatch 식 일관성 정규화 — pseudo-label 품질 보존).
+                if _use_sa:
+                    aug_unlabeled_mel = apply_spec_augment(unlabeled_mel, _sa_nf, _sa_f, _sa_nt, _sa_t)
+                    teacher_input = aug_unlabeled_mel if _sa_teacher_view == "augmented" else unlabeled_mel
+                    student_input = aug_unlabeled_mel
+                else:
+                    teacher_input = unlabeled_mel
+                    student_input = unlabeled_mel
+                fusion_output = ensemble_teacher(teacher_input, student_label_map)
 
                 # [신설 2026-08-22] 합의 기반 선별.
                 # specialist_weights[c] 는 전문가 c 가 "이건 내 클래스다"라고 본 확률이다.
@@ -631,7 +698,7 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
                 epoch_pseudo_conf_sum += float(pseudo_conf.sum().item())
 
                 if keep_mask.any():
-                    kept_mel = unlabeled_mel[keep_mask]
+                    kept_mel = student_input[keep_mask]
                     kept_teacher_logits = fusion_output.logits[keep_mask]
                     kept_teacher_feats = fusion_output.features[keep_mask]
                     kept_weights = pseudo_conf[keep_mask] if (_use_pl and _pl_weighting) else None
