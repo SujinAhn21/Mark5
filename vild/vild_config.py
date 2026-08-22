@@ -139,6 +139,20 @@ class AudioViLDConfig:
         self.segment_aggregation_mode = "confidence_saliency"
         self.segment_confidence_power = 2.0
         self.segment_saliency_power = 1.0
+        # === [신설 2026-08-22] others 결정 방식 ===
+        # "direct"     : Prob_others >= others_direct_threshold 이면 others (기본)
+        # "confidence" : 옛 방식 — top_conf/margin/entropy 세 조건 중 하나라도 걸리면 others 로 강제
+        #
+        # 옛 방식은 "모르겠으면 others" 라서 모델의 전반적인 확신도에 결과가 휘둘린다.
+        # pseudo-label CE 로 student 확신도가 0.4384 -> 0.8047 로 오르자 같은 임계값에서
+        # 강제 건수가 204 -> 22 로 줄며 others recall 이 0.574 -> 0.191 로 무너졌는데,
+        # 정작 others 단독 AUC 는 0.9754 -> 0.9871 로 올라 있었다. 규칙이 정보를 못 꺼낸 것이다.
+        # 근거 실측과 스윕표는 vild/postprocess_utils.py 의 apply_others_calibration docstring 참조.
+        self.others_decision_mode = "direct"
+        # val 430클립 스윕 최적값. 0.12~0.16 구간이 평평하다(macroF1 0.8736 / 0.8807 / 0.8705).
+        # ⚠ val 에서 고른 값이라 낙관 편향이 있고, 재학습하면 다시 스윕해야 한다.
+        self.others_direct_threshold = 0.14
+        # 아래 셋은 others_decision_mode="confidence" 일 때만 쓰인다.
         self.others_confidence_threshold = 0.45
         self.others_margin_threshold = 0.05
         # [삭제 2026-07-11] others_entropy_threshold 하드코딩(0.82) 제거, 아래 property로 대체.

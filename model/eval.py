@@ -120,6 +120,14 @@ def evaluate(mark_version: str, split: str = "test"):
     if background_embedding is not None:
         print(f"[INFO] background override: {'적용' if use_bg_override else '미적용'} "
               f"(others 로짓을 background embedding 으로 max 덮어쓰기)")
+    # [추가 2026-08-22] others 결정 방식을 로그에 남긴다. 이 값이 결과를 크게 가른다.
+    _od_mode = getattr(config, "others_decision_mode", "direct")
+    if _od_mode == "direct":
+        print(f"[INFO] others 결정: direct — Prob_others >= "
+              f"{getattr(config, 'others_direct_threshold', 0.14)} 이면 others")
+    else:
+        print(f"[INFO] others 결정: confidence — top_conf<{config.others_confidence_threshold} 또는 "
+              f"margin<{config.others_margin_threshold} 또는 entropy>{config.others_entropy_threshold:.3f} 이면 others 강제")
 
     encoder.eval()
     branch_head.eval()
@@ -205,6 +213,8 @@ def evaluate(mark_version: str, split: str = "test"):
                 "Raw Top Confidence": calib_meta["raw_top_conf"],
                 "Raw Margin": calib_meta["raw_margin"],
                 "Entropy": calib_meta["entropy"],
+                # [추가 2026-08-22] direct 모드가 실제로 보는 값. 스윕을 다시 돌릴 때 쓴다.
+                "Prob Others (raw)": calib_meta.get("prob_others", float("nan")),
                 **{f"Prob_{n}": float(raw_prob[i]) for i, n in enumerate(class_names)},
             }
         )

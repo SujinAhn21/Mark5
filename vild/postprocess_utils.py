@@ -25,6 +25,30 @@ def aggregate_segment_probs(segment_probs, saliency_scores, config):
 
 
 def apply_others_calibration(prob_vec, class_names, config):
+    """others 를 최종 결정하는 규칙.
+
+    [변경 2026-08-22] 기본 규칙을 "확신이 낮으면 others"(confidence/margin/entropy 3조건)에서
+    "Prob_others 자체가 임계값을 넘으면 others"(direct)로 바꿨다.
+
+    왜 바꿨나. 옛 규칙은 모델이 아무것도 확신하지 못할 때 others 로 보내는 방식이라,
+    모델의 전반적인 확신도에 결과가 휘둘린다. 실제로 pseudo-label CE 로 바꾼 뒤 student 의
+    Raw 최고확률 평균이 0.4384 에서 0.8047 로 올라가자, 같은 임계값(0.45)에서 강제 건수가
+    204건에서 22건으로 줄며 others recall 이 0.574 -> 0.191 로 무너졌다.
+
+    그런데 others 를 알아보는 능력 자체는 오히려 좋아져 있었다. val 430클립 실측:
+        others 단독 OvR AUC   기존 KD 0.9754  ->  pseudo-label CE 0.9871
+        Prob_others 격차       +0.1917        ->  +0.2224
+    즉 정보는 모델 안에 있는데 옛 규칙이 그것을 꺼내 쓰지 못하고 있었다.
+
+    direct 규칙으로 두 모델을 같은 자로 비교하면(val 430클립):
+        기존 KD          thr 0.16 -> acc 0.8488 / macroF1 0.8478 / others recall 0.702
+        pseudo-label CE  thr 0.14 -> acc 0.8814 / macroF1 0.8807 / others recall 0.787
+    thr 0.12~0.16 구간이 평평해(0.8744 / 0.8814 / 0.8721) 값에 예민하지 않다.
+
+    ⚠ 이 임계값은 val 에서 고른 값이라 낙관 편향이 있다. test 로 확인해야 하고,
+      재학습하면 확률 분포가 이동하므로 그때마다 다시 스윕해야 한다.
+    옛 규칙으로 되돌리려면 config 의 others_decision_mode 를 "confidence" 로 두면 된다.
+    """
     calibrated = prob_vec.copy()
     others_idx = class_names.index("others")
     top_idx = int(np.argmax(calibrated))
@@ -33,6 +57,35 @@ def apply_others_calibration(prob_vec, class_names, config):
     second_conf = float(calibrated[sorted_idx[1]]) if len(sorted_idx) > 1 else 0.0
     margin = top_conf - second_conf
     entropy = float(-(calibrated * np.log(np.clip(calibrated, 1e-8, 1.0))).sum() / np.log(len(class_names)))
+    prob_others = float(calibrated[others_idx])
+
+    mode = getattr(config, "others_decision_mode", "direct")
+    if mode == "direct":
+        thr = getattr(config, "others_direct_threshold", 0.14)
+        if prob_others >= thr:
+            # others 로 판정. 확률 벡터는 others 가 1등이 되도록만 최소 조정한다.
+            if top_idx != others_idx:
+                calibrated[others_idx] = max(calibrated[others_idx], top_conf + 1e-3)
+                calibrated = calibrated / calibrated.sum()
+            return calibrated, others_idx, {
+                "forced_to_others": top_idx != others_idx,
+                "raw_top_conf": top_conf,
+                "raw_margin": margin,
+                "entropy": entropy,
+                "prob_others": prob_others,
+            }
+        # others 가 아니다. others 열을 빼고 다시 고른다.
+        # (Prob_others 가 임계값 미만인데도 argmax 였다면 그 클립은 others 가 아니라고 본 것이므로
+        #  나머지 8개 중에서 정해야 앞뒤가 맞는다.)
+        masked = calibrated.copy()
+        masked[others_idx] = -1.0
+        return calibrated, int(np.argmax(masked)), {
+            "forced_to_others": False,
+            "raw_top_conf": top_conf,
+            "raw_margin": margin,
+            "entropy": entropy,
+            "prob_others": prob_others,
+        }
 
     forced = (
         top_idx != others_idx
@@ -50,6 +103,7 @@ def apply_others_calibration(prob_vec, class_names, config):
             "raw_top_conf": top_conf,
             "raw_margin": margin,
             "entropy": entropy,
+            "prob_others": prob_others,
         }
 
     return calibrated, top_idx, {
@@ -57,6 +111,7 @@ def apply_others_calibration(prob_vec, class_names, config):
         "raw_top_conf": top_conf,
         "raw_margin": margin,
         "entropy": entropy,
+        "prob_others": prob_others,
     }
 
 
