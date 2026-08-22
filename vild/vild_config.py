@@ -149,9 +149,12 @@ class AudioViLDConfig:
         # 정작 others 단독 AUC 는 0.9754 -> 0.9871 로 올라 있었다. 규칙이 정보를 못 꺼낸 것이다.
         # 근거 실측과 스윕표는 vild/postprocess_utils.py 의 apply_others_calibration docstring 참조.
         self.others_decision_mode = "direct"
-        # val 430클립 스윕 최적값. 0.12~0.16 구간이 평평하다(macroF1 0.8736 / 0.8807 / 0.8705).
-        # ⚠ val 에서 고른 값이라 낙관 편향이 있고, 재학습하면 다시 스윕해야 한다.
-        self.others_direct_threshold = 0.14
+        # [갱신 2026-08-23] 0.14 -> 0.09. 최종 채택 모델이 mark5.0_PL_SA(SpecAugment 포함)로
+        # 바뀌면서 확률 분포가 이동해 val 430클립 스윕을 다시 돌린 값이다
+        # (SA 모델: thr 0.09 -> acc 0.8814 / macroF1 0.8820. thr 0.14 였다면 0.8674/0.8667).
+        # 0.14 는 SpecAugment 없는 mark5.0_PL 의 최적값이었다.
+        # ⚠ val 에서 고른 값이라 낙관 편향이 있고, 재학습하면 반드시 다시 스윕한다(모델 종속).
+        self.others_direct_threshold = 0.09
         # 아래 셋은 others_decision_mode="confidence" 일 때만 쓰인다.
         self.others_confidence_threshold = 0.45
         self.others_margin_threshold = 0.05
