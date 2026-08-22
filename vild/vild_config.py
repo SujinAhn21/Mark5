@@ -256,10 +256,28 @@ class AudioViLDConfig:
         # 430샘플로 맞춰 과적합). 그래서 학습 단계에서 고친다. 여기서는 unlabeled 세그먼트
         # 10,000개 위에서 분포를 추정하므로 표본이 23배 크고 추정·적용 대상이 같다.
         self.use_distribution_alignment = True
-        # 보정 강도. 0=no-op(현재 동작), 1=완전 균등화.
-        # ⚠기본 0.5 는 아직 측정으로 정한 값이 아니다. val 430클립에 teacher 를 통과시켜
-        # pseudo-label 품질을 재고 확정할 것.
-        self.dist_align_tau = 0.5
+        # 보정 강도. 0=no-op, 1=관측 분포를 목표 분포로 완전 정렬.
+        #
+        # [확정 2026-08-22] tau=1.0. val 430클립(2150세그먼트)에 teacher 를 통과시켜
+        # model/sweep_dist_align.py 로 스윕한 결과 정확도가 단조 증가했다.
+        #     tau   off    0.25    0.5    0.75    1.0
+        #     acc   0.8744 0.8860 0.8860 0.8930 0.8977
+        #     othR  0.362  0.404  0.404  0.426  0.447
+        #     균등L1 0.1736 0.1550 0.1550 0.1354 0.1261
+        # teacher pseudo-label 정확도가 0.8744 -> 0.8977(+2.33%p), others recall 이
+        # 0.362 -> 0.447(+8.5%p) 오르고 construction 은 1.000 을 유지한다.
+        # 개선의 최대 기여는 water_toilet 0.792 -> 0.938(+14.6%p)인데, 이것이 test 혼동행렬의
+        # 최대 오분류(water_toilet -> construction 8건)와 정확히 같은 자리다.
+        #
+        # 실측된 편향(val, teacher 관측 분포 p_hat):
+        #   construction 0.1479(x0.75) · machine_noise 0.1479(x0.75) · water_shower 0.1243(x0.89)
+        #   others 0.0539(x2.06) · water_toilet 0.0883(x1.26)   (균등 = 0.1111)
+        #
+        # 1.0 을 고른 이유: 정확도 최고이고 0.75 와 차이가 작아 봉우리가 완만하다. 그리고
+        # "관측 분포를 목표 분포로 완전히 정렬"이라는 이론적 기준점이라 임의값이 아니다.
+        # ⚠이것은 teacher pseudo-label 의 품질이지 student 성능이 아니다. student 개선 여부는
+        # 재학습으로만 확인된다. 재학습 후에는 이 스윕을 다시 돌려 tau 를 재확인할 것.
+        self.dist_align_tau = 1.0
         # 관측 분포 EMA. 0.999 면 최근 수천 배치의 분포에 수렴한다.
         self.dist_align_momentum = 0.999
         self.text_loss_weight = 1.0
