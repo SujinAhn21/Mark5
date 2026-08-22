@@ -27,14 +27,26 @@ tau 를 바꿔가며 다음을 본다.
 좋아지면 student 도 좋아질 것이라는 가정 위에서 tau 를 고르는 것이고, 그 가정의 검증은
 재학습 1회로만 가능하다.
 
-⚠ 학습 때는 EMA 가 배치를 따라가며 갱신되지만, 여기서는 val 을 한 번 훑으므로 EMA 가
-학습만큼 수렴하지 않는다. 그래서 --two_pass 를 기본으로 둔다(1회차로 분포를 재고,
-2회차에서 그 분포로 보정). 학습에서의 정상 상태에 더 가깝다.
+EMA 를 쓰지 않는 이유 (2026-08-22 수정)
+--------------------------------------
+처음에는 학습과 똑같이 EMA 로 분포를 누적했는데, 그 측정이 학습 조건을 전혀 재현하지 못했다.
+
+  - dataset_val.csv 는 **클래스별로 완전히 정렬돼 있다**(construction 48개 연속, dog_bark 47개
+    연속, ...). 이 스크립트는 클립을 CSV 순서대로 하나씩(배치 = 5세그먼트) 통과시키므로,
+    momentum 을 낮추면 EMA 가 "지금 construction 이 100%" 라고 추정하고 정렬이 **정답 클래스를
+    억누른다.** 실제로 momentum 0.9 에서 tau 1.0 이면 정확도가 0.8744 -> 0.5186 으로 무너졌다.
+  - 반대로 momentum 0.999 로 두면 54배치로는 EMA 가 초기값(균등)에서 3% 밖에 안 움직여
+    보정이 사실상 안 걸린다(others 보정 비율 1.03배, 필요한 값은 2.51배).
+
+학습은 shuffle=True 로 배치 16개가 무작위이고 1250배치 x 49epoch = 6만 배치를 돌아 EMA 가
+전역 분포에 수렴한다. 그 정상 상태를 재현하려면 EMA 를 흉내낼 게 아니라 **전체 분포를 한 번에
+계산해 고정 보정**으로 재는 것이 맞다. 부수적으로 teacher forward 가 1회면 되고 tau 스윕은
+계산만으로 끝난다.
 
 실행
 ----
     python model/sweep_dist_align.py
-    python model/sweep_dist_align.py --taus 0,0.25,0.5,0.75,1.0 --limit 200
+    python model/sweep_dist_align.py --taus 0,0.1,0.25,0.5,0.75,1.0 --limit 200
 """
 
 import argparse
@@ -92,21 +104,44 @@ def collect_segments(rows, parser, device):
     return data
 
 
-def evaluate(data, teacher, class_map, classes, two_pass=True):
-    """teacher 를 통과시켜 클립 단위 argmax 예측을 낸다.
+def collect_probs(data, teacher, class_map):
+    """teacher 를 한 번만 통과시켜 세그먼트 확률을 전부 모은다.
 
-    two_pass=True 면 1회차로 EMA 분포만 채우고 2회차에서 보정된 값을 쓴다.
+    돌려주는 것:
+      seg_probs : 클립마다 [세그먼트 수, 9] 확률 텐서의 리스트 (정렬 **전** 값)
+      truths    : 클립별 정답 라벨
+    이후 tau 스윕은 이 확률 위에서 계산만으로 한다.
     """
-    passes = 2 if (two_pass and teacher.use_distribution_alignment) else 1
-    preds, truths = [], []
-    for p in range(passes):
-        preds, truths = [], []
-        for mel, label in data:
-            out = teacher(mel, class_map)
-            prob = torch.softmax(out.logits, dim=1).mean(dim=0)
-            preds.append(classes[int(prob.argmax())])
-            truths.append(label)
-    return preds, truths
+    seg_probs, truths = [], []
+    for mel, label in data:
+        out = teacher(mel, class_map)
+        seg_probs.append(torch.softmax(out.logits, dim=1).detach())
+        truths.append(label)
+    return seg_probs, truths
+
+
+def align_and_predict(seg_probs, classes, tau):
+    """전역 분포로 고정 보정한 뒤 클립 단위 argmax.
+
+    p_hat 은 전체 세그먼트의 평균 확률(= 학습에서 EMA 가 수렴하는 값),
+    p_target 은 균등이다. aligned ∝ p x (p_target / p_hat)^tau.
+    """
+    allp = torch.cat(seg_probs, dim=0)
+    p_hat = allp.mean(dim=0)
+    p_hat = p_hat / p_hat.sum().clamp_min(1e-12)
+    n = len(classes)
+    p_target = torch.full_like(p_hat, 1.0 / n)
+
+    preds = []
+    if tau == 0:
+        ratio = torch.ones_like(p_hat)
+    else:
+        ratio = (p_target / p_hat.clamp_min(1e-8)) ** tau
+    for p in seg_probs:
+        q = p * ratio.unsqueeze(0)
+        q = q / q.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        preds.append(classes[int(q.mean(dim=0).argmax())])
+    return preds, p_hat
 
 
 def report(tag, preds, truths, classes):
@@ -135,9 +170,6 @@ def main():
     ap.add_argument("--limit", type=int, default=None, help="클립 수 제한(빠른 확인용)")
     ap.add_argument("--split", default="val", choices=["val", "test"],
                     help="기본 val. test 는 최종 확인용이므로 함부로 쓰지 말 것")
-    ap.add_argument("--momentum", type=float, default=None,
-                    help="미지정이면 config 값. val 은 27배치뿐이라 0.9 정도가 적절할 수 있음")
-    ap.add_argument("--single_pass", action="store_true", help="2-pass 대신 1-pass")
     args = ap.parse_args()
 
     config = AudioViLDConfig(mark_version="mark5.0")
@@ -161,30 +193,35 @@ def main():
     print(f"  유효 클립 {len(data)}개")
 
     taus = [float(t) for t in args.taus.split(",") if t.strip()]
-    mom = args.momentum if args.momentum is not None else getattr(config, "dist_align_momentum", 0.999)
     spec = build_specialist_config()
 
     print()
-    print(f"[2/2] tau 스윕 — momentum={mom}, {'1-pass' if args.single_pass else '2-pass'}")
-    results = []
-
-    # 기준선: 정렬 없음
+    print("[2/2] teacher 통과 (1회) — 이후 tau 스윕은 계산만")
+    # 정렬은 끄고 원본 확률을 받는다. 보정은 아래에서 전역 분포로 직접 건다.
     base_teacher = EnsembleTeacher(
         spec, device,
         others_rule=getattr(config, "fusion_others_rule", "min"),
         score_mode=getattr(config, "fusion_score_mode", "margin"),
         use_distribution_alignment=False)
-    preds, truths = evaluate(data, base_teacher, class_map, classes, two_pass=False)
+    seg_probs, truths = collect_probs(data, base_teacher, class_map)
+    total_segs = sum(p.shape[0] for p in seg_probs)
+    print(f"  세그먼트 {total_segs}개 확보")
+
+    _, p_hat = align_and_predict(seg_probs, classes, 0.0)
+    print()
+    print("  teacher 관측 분포 p_hat (학습에서 EMA 가 수렴하는 값)")
+    for i, c in enumerate(classes):
+        print(f"    {c:14s} {p_hat[i]:.4f}   보정배율(tau=1) x{(1.0/len(classes))/max(float(p_hat[i]),1e-8):.2f}")
+
+    results = []
+    preds, _ = align_and_predict(seg_probs, classes, 0.0)
     acc, rec, l1 = report("정렬 없음 (현재)", preds, truths, classes)
     results.append(("off", acc, rec, l1))
 
     for tau in taus:
-        t = EnsembleTeacher(
-            spec, device,
-            others_rule=getattr(config, "fusion_others_rule", "min"),
-            score_mode=getattr(config, "fusion_score_mode", "margin"),
-            use_distribution_alignment=True, dist_align_tau=tau, dist_align_momentum=mom)
-        preds, truths = evaluate(data, t, class_map, classes, two_pass=not args.single_pass)
+        if tau == 0:
+            continue  # off 와 동일하므로 건너뛴다
+        preds, _ = align_and_predict(seg_probs, classes, tau)
         acc, rec, l1 = report(f"tau = {tau:g}", preds, truths, classes)
         results.append((f"{tau:g}", acc, rec, l1))
 
