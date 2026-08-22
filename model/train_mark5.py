@@ -3,6 +3,7 @@ import sys
 import csv
 import argparse
 import hashlib
+import time
 
 import matplotlib.pyplot as plt
 import torch
@@ -106,12 +107,13 @@ def _align_teacher_arch(config, state_dict, class_name, ckpt_name):
 
 
 class EnsembleTeacher:
-    def __init__(self, specialist_config, device, others_rule="min"):
+    def __init__(self, specialist_config, device, others_rule="min", score_mode="margin"):
         self.device = device
         self.specialists = {}
         self.embedding_dim = None
         self.fusion = None  # WeightedTeacherFusion은 배치마다 재생성하지 않고 1회 생성 후 재사용
         self.others_rule = others_rule  # [추가 2026-08-18] fusion 의 others 칸 조립 규칙
+        self.score_mode = score_mode    # [추가 2026-08-22] 담당 칸 점수: "raw" | "margin"
         for class_name, paths in specialist_config.items():
             encoder_ckpt = load_checkpoint(_resolve_resource_path(paths["encoder_path"]), map_location=device)
             config = AudioViLDConfig(mark_version=paths["mark_version"])
@@ -161,6 +163,7 @@ class EnsembleTeacher:
             self.fusion = WeightedTeacherFusion(
                 student_class_map, self.embedding_dim, self.device,
                 others_rule=self.others_rule,
+                score_mode=self.score_mode,
             )
         return self.fusion.fuse(fusion_inputs)
 
@@ -284,7 +287,8 @@ class DistillationLoss(nn.Module):
     """
 
     def __init__(self, temperature, alpha, feature_kd_weight=0.0,
-                 use_dkd=False, dkd_alpha=1.0, dkd_beta=1.0):
+                 use_dkd=False, dkd_alpha=1.0, dkd_beta=1.0,
+                 use_pseudo_label_ce=False):
         super().__init__()
         self.temperature = temperature
         self.alpha = alpha
@@ -292,10 +296,15 @@ class DistillationLoss(nn.Module):
         self.use_dkd = use_dkd
         self.dkd_alpha = dkd_alpha
         self.dkd_beta = dkd_beta
+        # [추가 2026-08-22] unlabeled 신호를 KL 대신 pseudo-label CE 로 거는 스위치.
+        self.use_pseudo_label_ce = use_pseudo_label_ce
         self.hard = nn.CrossEntropyLoss()
+        # per-sample 가중치를 곱하려면 배치 평균 전 값이 필요하다.
+        self.pseudo = nn.CrossEntropyLoss(reduction="none")
         self.soft = nn.KLDivLoss(reduction="batchmean")
 
-    def forward(self, student_logits, hard_targets=None, teacher_logits=None, student_features=None, teacher_features=None):
+    def forward(self, student_logits, hard_targets=None, teacher_logits=None,
+                student_features=None, teacher_features=None, pseudo_weights=None):
         total = torch.tensor(0.0, device=student_logits.device)
         hard_loss = torch.tensor(0.0, device=student_logits.device)
         soft_loss = torch.tensor(0.0, device=student_logits.device)
@@ -306,7 +315,21 @@ class DistillationLoss(nn.Module):
             total = total + (1 - self.alpha) * hard_loss
 
         if teacher_logits is not None and len(teacher_logits) > 0:
-            if self.use_dkd:
+            if self.use_pseudo_label_ce:
+                # [신설 2026-08-22] teacher 에게서 분포가 아니라 정답만 받는다.
+                # 근거: T=4.0 에서 soft target 의 정규화 엔트로피가 0.9704(균등=1.0)라
+                # KL 이 나르는 정보가 0.0113 nats 뿐인데, 같은 teacher 의 argmax 는
+                # non-others 에서 0.8940 로 맞는다. 즉 정보는 분포가 아니라 argmax 에 있다.
+                # 분포를 따라하게 하면 teacher 의 애매함과 오류까지 함께 배운다.
+                pseudo_targets = teacher_logits.argmax(dim=1)
+                per_sample = self.pseudo(student_logits, pseudo_targets)
+                if pseudo_weights is not None:
+                    # 가중 평균. 분모가 0 에 가까우면(전부 저확신) 손실을 0 으로 둔다.
+                    denom = pseudo_weights.sum().clamp_min(1e-6)
+                    soft_loss = (per_sample * pseudo_weights).sum() / denom
+                else:
+                    soft_loss = per_sample.mean()
+            elif self.use_dkd:
                 # 타겟 축은 teacher 앙상블의 argmax. unlabeled 라 정답 라벨이 없다.
                 target_idx = teacher_logits.argmax(dim=1)
                 soft_loss, _, _ = dkd_loss(
@@ -416,7 +439,12 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, collate_fn=custom_collate)
 
     student_encoder = build_audio_encoder(config).to(device)
-    student_branch = DualBranchStudentHead(config.embedding_dim).to(device)
+    # [변경 2026-08-22] distill branch 마지막 ReLU 를 config 로 제어한다(기본 없음).
+    # eval.py 도 같은 값을 읽어야 state_dict 구조가 맞는다.
+    student_branch = DualBranchStudentHead(
+        config.embedding_dim,
+        distill_final_relu=getattr(config, "distill_branch_final_relu", False),
+    ).to(device)
     student_classifier = ViLDTextHead(config).to(device)
     student_text_emb = config.get_class_text_embeddings(for_evaluation=True).to(device)
     student_label_map = config.get_target_label_map()
@@ -445,8 +473,13 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
         "dog_bark": {"mark_version": "mark4.8", "encoder_path": "best_teacher_encoder_mark4.8.pth", "classifier_path": "best_teacher_classifier_mark4.8.pth"},
     }
     _others_rule = getattr(config, "fusion_others_rule", "min")
-    ensemble_teacher = EnsembleTeacher(specialist_config, device, others_rule=_others_rule)
-    print(f"[INFO] teacher fusion: others 칸 조립 규칙 = {_others_rule}")
+    _score_mode = getattr(config, "fusion_score_mode", "margin")
+    ensemble_teacher = EnsembleTeacher(specialist_config, device,
+                                       others_rule=_others_rule, score_mode=_score_mode)
+    if _score_mode == "margin":
+        print("[INFO] teacher fusion: 담당 칸 = margin(target-others), others 칸 = -max(margin)")
+    else:
+        print(f"[INFO] teacher fusion: 담당 칸 = raw logit, others 칸 조립 규칙 = {_others_rule}")
     teacher_feature_cache = []
     unlabeled_metadata_cache = []
 
@@ -461,13 +494,27 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
     # 그대로 옮겨오지 않는다. 다만 조정이 필요할 때 코드를 고치지 않고 config 만 바꾸도록 통로를 둔다.
     _alpha = getattr(config, "distill_alpha", 0.7)
     _temp = getattr(config, "distill_temperature", 4.0)
+    # [추가 2026-08-22] pseudo-label CE 설정
+    _use_pl = getattr(config, "use_pseudo_label_ce", False)
+    _pl_min_conf = getattr(config, "pseudo_label_min_confidence", 0.5)
+    _pl_weighting = getattr(config, "pseudo_label_confidence_weighting", True)
+    _distill_classify = getattr(config, "distill_branch_classify", False)
     criterion = DistillationLoss(
         temperature=_temp, alpha=_alpha,
         feature_kd_weight=config.feature_kd_weight if config.use_feature_kd else 0.0,
-        use_dkd=_use_dkd, dkd_alpha=_dkd_a, dkd_beta=_dkd_b)
-    print(f"[INFO] KD 모드: {'DKD' if _use_dkd else 'vanilla KD'}"
-          + (f" (dkd_alpha={_dkd_a}, dkd_beta={_dkd_b}, 타겟축=teacher argmax)" if _use_dkd else "")
-          + f" | alpha={_alpha}, T={_temp}, feature_kd={config.feature_kd_weight if config.use_feature_kd else 0.0}")
+        use_dkd=_use_dkd, dkd_alpha=_dkd_a, dkd_beta=_dkd_b,
+        use_pseudo_label_ce=_use_pl)
+    if _use_pl:
+        _mode_name = "pseudo-label CE"
+    elif _use_dkd:
+        _mode_name = "DKD"
+    else:
+        _mode_name = "vanilla KD"
+    print(f"[INFO] KD 모드: {_mode_name}"
+          + (f" (dkd_alpha={_dkd_a}, dkd_beta={_dkd_b}, 타겟축=teacher argmax)" if _use_dkd and not _use_pl else "")
+          + (f" | 채택 임계값={_pl_min_conf}, 확신도 가중={_pl_weighting}" if _use_pl else f" | T={_temp}")
+          + f" | alpha={_alpha}, feature_kd={config.feature_kd_weight if config.use_feature_kd else 0.0}"
+          + f" | distill branch 분류손실={_distill_classify}")
     optimizer_params = list(student_encoder.parameters()) + list(student_branch.parameters())
     if background_embedding is not None:
         optimizer_params += list(background_embedding.parameters())
@@ -506,6 +553,12 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
         student_branch.train()
         total_loss = total_hard_loss = total_soft_loss = total_feat_loss = 0.0
         total_bg_loss = 0.0
+        # [추가 2026-08-22] pseudo-label 채택 통계와 epoch 소요시간.
+        total_distill_cls_loss = 0.0
+        epoch_pseudo_total = 0
+        epoch_pseudo_kept = 0
+        epoch_pseudo_conf_sum = 0.0
+        epoch_started_at = time.time()
         # [추가 2026-08-17] 캐시를 에폭마다 비운다. teacher 는 eval·no_grad·가중치 고정이라
         # 같은 입력에 늘 같은 값을 내므로 에폭마다 쌓아봐야 같은 값이 num_epochs 벌 중복될 뿐이다.
         # 그대로 두면 80 에폭에서 리스트가 1GB 넘게 불어나고 torch.cat 이 그만큼 사본을 또 만든다.
@@ -543,18 +596,56 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
             if unlabeled_indices:
                 unlabeled_mel = mel[unlabeled_indices]
                 fusion_output = ensemble_teacher(unlabeled_mel, student_label_map)
-                base_features = student_encoder(unlabeled_mel)
-                supervised_features, distill_features = student_branch(base_features)
-                student_logits = student_classifier(supervised_features, student_text_emb)
-                soft_total, _, soft_loss, feat_loss = criterion(
-                    student_logits,
-                    teacher_logits=fusion_output.logits,
-                    student_features=distill_features,
-                    teacher_features=fusion_output.features,
-                )
-                loss = loss + soft_total
-                total_soft_loss += soft_loss.item()
-                total_feat_loss += feat_loss.item()
+
+                # [신설 2026-08-22] 합의 기반 선별.
+                # specialist_weights[c] 는 전문가 c 가 "이건 내 클래스다"라고 본 확률이다.
+                # 그 최대값이 곧 "여덟 명 중 가장 강한 주장의 세기"이고, 이것이 낮으면
+                # 아무도 이 소리를 자기 것이라고 보지 않았다는 뜻이다. 그런 클립에 argmax 로
+                # 억지 정답을 붙이면 오답이 그대로 student 에게 주입되므로 학습에서 뺀다.
+                # (fusion_output.uncertainty 가 정확히 1 - 이 최대값이다.)
+                pseudo_conf = 1.0 - fusion_output.uncertainty       # [B]
+                if _use_pl and _pl_min_conf > 0:
+                    keep_mask = pseudo_conf >= _pl_min_conf
+                else:
+                    keep_mask = torch.ones_like(pseudo_conf, dtype=torch.bool)
+
+                epoch_pseudo_total += int(keep_mask.numel())
+                epoch_pseudo_kept += int(keep_mask.sum().item())
+                epoch_pseudo_conf_sum += float(pseudo_conf.sum().item())
+
+                if keep_mask.any():
+                    kept_mel = unlabeled_mel[keep_mask]
+                    kept_teacher_logits = fusion_output.logits[keep_mask]
+                    kept_teacher_feats = fusion_output.features[keep_mask]
+                    kept_weights = pseudo_conf[keep_mask] if (_use_pl and _pl_weighting) else None
+
+                    base_features = student_encoder(kept_mel)
+                    supervised_features, distill_features = student_branch(base_features)
+                    student_logits = student_classifier(supervised_features, student_text_emb)
+                    soft_total, _, soft_loss, feat_loss = criterion(
+                        student_logits,
+                        teacher_logits=kept_teacher_logits,
+                        student_features=distill_features,
+                        teacher_features=kept_teacher_feats,
+                        pseudo_weights=kept_weights,
+                    )
+                    loss = loss + soft_total
+                    total_soft_loss += soft_loss.item()
+                    total_feat_loss += feat_loss.item()
+
+                    # [신설 2026-08-22] distill branch 에도 분류 손실을 건다.
+                    # 이 갈래는 지금까지 feature KD 만 받아 분류를 배운 적이 없는데,
+                    # eval.py 는 distill_branch_eval_weight=0.5 로 최종 확률의 절반을
+                    # 이 갈래에서 가져간다. 분류를 배운 적 없는 표현으로 분류를 하고 있었던 셈이다.
+                    if _use_pl and _distill_classify:
+                        distill_logits = student_classifier(distill_features, student_text_emb)
+                        db_total, _, db_loss, _ = criterion(
+                            distill_logits,
+                            teacher_logits=kept_teacher_logits,
+                            pseudo_weights=kept_weights,
+                        )
+                        loss = loss + db_total
+                        total_distill_cls_loss += db_loss.item()
                 teacher_feature_cache.append(fusion_output.features.detach().cpu())
                 for local_pos, batch_idx in enumerate(unlabeled_indices):
                     meta = dict(metadata_batch[batch_idx])
@@ -564,6 +655,10 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
                         name: float(weight[local_pos].item())
                         for name, weight in fusion_output.specialist_weights.items()
                     }
+                    # [추가 2026-08-22] 이 세그먼트가 pseudo-label 로 채택됐는지와 그때의 확신도.
+                    # 나중에 "어떤 소리가 계속 탈락하는가"를 분석할 재료가 된다.
+                    meta["pseudo_confidence"] = float(pseudo_conf[local_pos].item())
+                    meta["pseudo_kept"] = bool(keep_mask[local_pos].item())
                     unlabeled_metadata_cache.append(meta)
 
             if loss.requires_grad and loss.item() > 0:
@@ -602,7 +697,21 @@ def train_mark5(seed_value=42, mark_version="mark5.0"):
         val_hist.append(avg_val)
         val_hard_hist.append(avg_val_hard)
 
-        print(f"[Epoch {epoch+1}] Total {avg_loss:.4f} | Hard {avg_hard:.4f} | Soft {avg_soft:.4f} | Feat {avg_feat:.4f} | BG {avg_bg:.4f} | Val(hard*) {avg_val_hard:.4f}")
+        # [추가 2026-08-22] pseudo-label 채택률·평균 확신도·epoch 소요시간.
+        # 채택률이 계속 낮으면(예: 0.3 미만) unlabeled 를 대부분 버리고 있다는 뜻이라
+        # pseudo_label_min_confidence 를 내려야 한다. 반대로 1.0 에 붙어 있으면 선별이
+        # 아무 일도 안 하고 있다는 뜻이다.
+        _keep_ratio = (epoch_pseudo_kept / epoch_pseudo_total) if epoch_pseudo_total else 0.0
+        _mean_conf = (epoch_pseudo_conf_sum / epoch_pseudo_total) if epoch_pseudo_total else 0.0
+        _elapsed = time.time() - epoch_started_at
+        _extra = ""
+        if _use_pl:
+            _extra = f" | PL채택 {_keep_ratio:.3f}({epoch_pseudo_kept}/{epoch_pseudo_total}) conf {_mean_conf:.3f}"
+            if _distill_classify:
+                _avg_db = total_distill_cls_loss / max(1, len(train_loader))
+                _extra += f" | DistillCls {_avg_db:.4f}"
+        print(f"[Epoch {epoch+1}] Total {avg_loss:.4f} | Hard {avg_hard:.4f} | Soft {avg_soft:.4f} | Feat {avg_feat:.4f} | BG {avg_bg:.4f} | Val(hard*) {avg_val_hard:.4f}"
+              + _extra + f" | {_elapsed:.1f}s")
 
         # [추가 2026-08-17] LR 스케줄 · best 저장 · early stopping (mark4.x 와 같은 절차)
         scheduler.step(avg_val)

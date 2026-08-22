@@ -190,12 +190,45 @@ class AudioViLDConfig:
         # [추가 2026-08-17] KD 하이퍼파라미터. 값은 컨퍼런스 코드(mark3.2)에서 검증한 0.7 / 4.0 그대로이고,
         # train_mark5.py 에 하드코딩돼 있던 것을 config 로 뺀 것뿐이다.
         # mark4.x 의 0.3 / 2.0 은 같은 샘플에 hard·soft 를 함께 거는 구조에서 나온 값이라 옮겨오지 않는다.
-        self.distill_alpha = 0.7
+        # [변경 2026-08-22] 0.7 -> 0.3. 아래 use_pseudo_label_ce 로 unlabeled 신호가
+        # "teacher 분포 따라하기(KL)" 에서 "teacher 가 고른 정답으로 CE" 로 바뀌면서
+        # alpha 의 의미가 달라졌다. 이제 두 항이 모두 CE 이고, unlabeled 쪽 정답은
+        # 사람 라벨이 아니라 정확도 0.894 짜리 pseudo-label 이다. 정확도가 낮은 쪽이
+        # 사람 라벨보다 2.33 배 무거우면 안 되므로, mark4.x 와 같은 0.3 으로 내린다.
+        self.distill_alpha = 0.3
         self.distill_temperature = 4.0
         # [추가 2026-08-18] teacher fusion 의 others 칸 조립 규칙: "min" | "mean" | "max".
-        # 기본 min. 옛 동작(다수결 편향이 있는 평균)으로 되돌리려면 "mean" 으로 두면 된다.
-        # 실측 근거는 vild/teacher_fusion.py 의 WeightedTeacherFusion docstring 참조.
+        # fusion_score_mode 가 "raw" 일 때만 쓰인다("margin" 이면 others 칸이 -max(margin) 로
+        # 정해져 이 값이 무시된다). 실측 근거는 vild/teacher_fusion.py docstring 참조.
         self.fusion_others_rule = "min"
+
+        # === [신설 2026-08-22] teacher 조립 방식과 pseudo-label 학습 ===
+        # 배경: 1차 학습 뒤 실측에서 (a) fused teacher 자신의 val 정확도가 0.7488 로
+        # student(0.8395)보다 낮고, (b) T=4.0 에서 soft target 의 정규화 엔트로피가 0.9704 로
+        # 거의 균등분포라 KL 이 나르는 정보가 0.0113 nats 뿐이고, (c) 그런데도 teacher 의
+        # argmax 는 non-others 에서 0.8940 로 꽤 맞는다는 것이 확인됐다.
+        # 결론: teacher 에게서 분포를 받지 말고 **정답만** 받는다. 그게 mark3.0.0 의 원래
+        # hybrid(soft label 의 argmax 를 hard label 로 쓰는 방식)이기도 하다.
+
+        # 담당 칸에 target 로짓 원본을 넣을지(raw) margin(target-others)을 넣을지(margin).
+        # margin 이 전문가별 스케일 차이(평균 2.07, 표준편차 3.8배)를 상쇄한다.
+        self.fusion_score_mode = "margin"
+        # unlabeled 손실을 KL(분포 따라하기) 대신 pseudo-label CE 로 건다.
+        self.use_pseudo_label_ce = True
+        # pseudo-label 채택 임계값. 담당 전문가의 "내 클래스" 확률(specialist positive weight)
+        # 최대값이 이 값 미만이면 그 샘플은 학습에서 통째로 뺀다. 8명 중 아무도 확신하지 못한
+        # 클립에 억지로 정답을 붙이면 그 오답이 그대로 student 에게 주입되기 때문이다.
+        # 0.5 는 "적어도 한 명은 자기 것이라고 말한다"는 뜻이다.
+        self.pseudo_label_min_confidence = 0.5
+        # 채택된 샘플에 per-sample 가중치를 준다. 가중치는 그 최대 확률값 자체.
+        # 확신이 0.95 인 클립과 0.52 인 클립을 같은 무게로 배우지 않게 한다.
+        self.pseudo_label_confidence_weighting = True
+        # distill branch 에도 분류 손실(pseudo CE)을 건다.
+        # 지금까지 이 갈래는 feature KD 만 받아 분류를 배운 적이 없는데, eval 에서는
+        # distill_branch_eval_weight=0.5 로 최종 확률의 절반을 차지하고 있었다.
+        self.distill_branch_classify = True
+        # distill branch 마지막 ReLU. 기본은 뺀다(근거는 vild/vild_head.py docstring).
+        self.distill_branch_final_relu = False
         self.text_loss_weight = 1.0
         self.image_loss_weight = 1.0
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -259,19 +292,33 @@ class AudioViLDConfig:
 
     @property
     def run_tag(self) -> str:
-        """[신설 2026-08-21] 산출물 파일명에 붙일 실행 태그.
+        """[신설 2026-08-21 / 확장 2026-08-22] 산출물 파일명에 붙일 실행 태그.
 
-        1차(vanilla KD)와 2차(DKD)가 같은 이름으로 저장돼 서로를 덮는 문제를 막는다.
-        use_dkd=False 면 mark_version 그대로라 1차 파일명은 하나도 바뀌지 않고,
-        True 로 바꾸는 순간 student 체크포인트 · 손실곡선 PNG · loss_history CSV ·
+        서로 다른 학습 설정이 같은 이름으로 저장돼 앞선 결과를 덮는 것을 막는다.
+        붙는 순서는 아래 코드 그대로이고, 조합되면 이어붙는다(예: mark5.0_PL_DKD).
+
+            (없음) : 1차 학습과 완전히 같은 설정 — vanilla KD, raw 조립
+            _PL    : use_pseudo_label_ce=True  (unlabeled 를 KL 대신 pseudo-label CE 로)
+            _RAW   : fusion_score_mode="raw"   (PL 을 쓰면서 옛 조립으로 되돌린 경우만)
+            _DKD   : use_dkd=True
+
+        태그가 갈리는 산출물: student 체크포인트 · 손실곡선 PNG · loss_history CSV ·
         혼동행렬 · ROC · performance_summary · calibration_details ·
-        prediction_details · 설명 PNG 폴더가 전부 _DKD 로 갈린다.
+        prediction_details · 설명 PNG 폴더.
 
-        일부러 태그를 안 붙이는 것: cache/{mark_version}/ 의 teacher feature 캐시
-        (teacher 출력은 DKD 와 무관해서 2차가 1차 캐시를 재사용하는 편이 빠르다),
+        일부러 태그를 안 붙이는 것: cache/{mark_version}/ 의 teacher feature 캐시,
         resources/ 의 teacher .pth, dataset_*.csv 인덱스.
+
+        ⚠ eval.py 도 이 태그로 체크포인트를 찾으므로, 학습과 평가의 config 가 같아야 한다.
         """
-        return f"{self.mark_version}_DKD" if self.use_dkd else self.mark_version
+        tag = self.mark_version
+        if getattr(self, "use_pseudo_label_ce", False):
+            tag += "_PL"
+            if getattr(self, "fusion_score_mode", "margin") == "raw":
+                tag += "_RAW"
+        if self.use_dkd:
+            tag += "_DKD"
+        return tag
 
     @property
     def others_entropy_threshold(self) -> float:

@@ -81,7 +81,11 @@ def evaluate(mark_version: str, split: str = "test"):
 
     encoder = build_audio_encoder(config).to(device)
     encoder.load_state_dict(resolve_state_dict(checkpoint, "model_state_dict", "encoder_state_dict", "model"))
-    branch_head = DualBranchStudentHead(config.embedding_dim).to(device)
+    # [변경 2026-08-22] 학습 때와 같은 구조로 만들어야 branch state_dict 가 맞는다.
+    branch_head = DualBranchStudentHead(
+        config.embedding_dim,
+        distill_final_relu=getattr(config, "distill_branch_final_relu", False),
+    ).to(device)
     # [수정 2026-08-17] resolve_state_dict 는 아는 키가 하나도 없으면 KeyError 를 던지므로,
     # 아래 else 의 경고는 도달할 수 없는 코드였다(구버전 .pth 를 넣으면 경고 대신 죽었다).
     # 직접 get 으로 받아 경고 분기가 실제로 살아나게 한다.
